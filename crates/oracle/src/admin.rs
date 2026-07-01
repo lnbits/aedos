@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
+use tokio::time::timeout;
+use tokio_tungstenite::connect_async;
 use uuid::Uuid;
 
 use crate::{api::AppState, db::status_str, types::{TargetType, Verdict, VerdictStatus}};
@@ -81,6 +83,14 @@ struct Overview {
     retry_jobs: i64,
     dead_letter_jobs: i64,
     status_counts: HashMap<String, i64>,
+    relays: Vec<RelayStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct RelayStatus {
+    url: String,
+    online: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -272,6 +282,7 @@ async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Result<J
         status_counts.insert(row.try_get("status")?, row.try_get("count")?);
     }
     let (queued_jobs, retry_jobs, dead_letter_jobs) = queue_counts(&state).await;
+    let relays = relay_statuses(pool, &state).await;
     Ok(Json(Overview {
         total_processed,
         processed_today,
@@ -280,6 +291,7 @@ async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Result<J
         retry_jobs,
         dead_letter_jobs,
         status_counts,
+        relays,
     }))
 }
 
@@ -629,6 +641,52 @@ async fn queue_counts(state: &AppState) -> (i64, i64, i64) {
     let retry = conn.zcard("oracle:analysis:retry").await.unwrap_or(0);
     let dead = redis::cmd("XLEN").arg("oracle:analysis:dead").query_async(&mut conn).await.unwrap_or(0);
     (queued, retry, dead)
+}
+
+async fn relay_statuses(pool: &PgPool, state: &AppState) -> Vec<RelayStatus> {
+    let relays = current_settings(pool)
+        .await
+        .ok()
+        .and_then(|settings| settings.get("NOSTR_RELAYS").map(|value| csv_value(value)))
+        .filter(|relays| !relays.is_empty())
+        .unwrap_or_else(|| state.config.nostr_relays.clone());
+
+    futures_util::future::join_all(relays.into_iter().map(check_relay)).await
+}
+
+async fn check_relay(url: String) -> RelayStatus {
+    match url::Url::parse(&url) {
+        Ok(parsed) if matches!(parsed.scheme(), "ws" | "wss") => {}
+        Ok(_) => {
+            return RelayStatus {
+                url,
+                online: false,
+                error: Some("URL must start with ws:// or wss://".to_string()),
+            };
+        }
+        Err(error) => {
+            return RelayStatus {
+                url,
+                online: false,
+                error: Some(error.to_string()),
+            };
+        }
+    }
+
+    match timeout(Duration::from_secs(3), connect_async(url.as_str())).await {
+        Ok(Ok((_socket, _response))) => RelayStatus { url, online: true, error: None },
+        Ok(Err(error)) => RelayStatus { url, online: false, error: Some(error.to_string()) },
+        Err(_) => RelayStatus { url, online: false, error: Some("connection timed out".to_string()) },
+    }
+}
+
+fn csv_value(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn verdict_from_review(sha256: String, req: ChangeVerdictRequest) -> Verdict {

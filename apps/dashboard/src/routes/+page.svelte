@@ -13,6 +13,13 @@
     retry_jobs: number;
     dead_letter_jobs: number;
     status_counts: Record<string, number>;
+    relays: RelayStatus[];
+  };
+
+  type RelayStatus = {
+    url: string;
+    online: boolean;
+    error: string | null;
   };
 
   type ImageItem = {
@@ -46,8 +53,31 @@
     secret: boolean;
   };
 
-  const api = async <T>(path: string, options: RequestInit = {}): Promise<T> => {
-    const response = await fetch(path, {
+  type Toast = {
+    id: number;
+    message: string;
+    tone: 'success' | 'error' | 'info';
+  };
+
+  const settingHints: Record<string, string> = {
+    DEFAULT_POLICY: 'Fallback verdict when an event cannot be fully reviewed. Usually blur_unknown or block_unknown.',
+    ENABLE_ESCALATION: 'Reserved for serious incident workflows. Keep false unless you have a legal/process path in place.',
+    IMAGE_FETCH_TIMEOUT_SECONDS: 'How long the worker waits when downloading an image before marking the job as failed.',
+    LABEL_NAMESPACE: 'Nostr label namespace written into published moderation labels.',
+    MAX_IMAGE_BYTES: 'Largest image the worker will download and review. Bigger values cost more bandwidth and AI spend.',
+    MODERATION_PROVIDER: 'Image review backend. Use deterministic for local testing or openai for OpenAI moderation.',
+    NOSTR_PRIVATE_KEY: 'Secret key used to sign Aedos label events so clients and relays can verify the source.',
+    NOSTR_RELAYS: 'Comma-separated relays where Aedos publishes moderation labels.',
+    OPENAI_API_KEY: 'OpenAI API key used only when MODERATION_PROVIDER is set to openai.',
+    OPENAI_MODERATION_MODEL: 'OpenAI moderation model name used for image review.',
+    QUEUE_DEAD_LETTER_MAXLEN: 'Maximum retained failed jobs in the dead-letter stream.',
+    QUEUE_STREAM_MAXLEN: 'Approximate maximum retained pending/processed queue entries in Redis.',
+    RATE_LIMIT_CHECKS_PER_MINUTE: 'Per-client API limit for moderation check requests.',
+    WORKER_CONCURRENCY: 'Number of images the Python worker can process in parallel.'
+  };
+
+  async function api<T>(requestPath: string, options: RequestInit = {}): Promise<T> {
+    const response = await fetch(requestPath, {
       ...options,
       headers: {
         'content-type': 'application/json',
@@ -59,13 +89,13 @@
       throw new Error(body.error ?? 'request failed');
     }
     return response.json();
-  };
+  }
 
   let session: Session = $state({ authenticated: false, username: null, needs_setup: true });
   let activeView = $state<'dashboard' | 'images' | 'settings'>('dashboard');
   let username = $state('');
   let password = $state('');
-  let authError = $state('');
+  let confirmPassword = $state('');
   let loading = $state(true);
   let overview = $state<Overview | null>(null);
   let images = $state<ImagesResponse>({ items: [], total: 0, page: 1, per_page: 25 });
@@ -78,7 +108,8 @@
   let reviewLabels = $state('safe');
   let reviewConfidence = $state(1);
   let reviewExplanation = $state('');
-  let message = $state('');
+  let toasts = $state<Toast[]>([]);
+  let nextToastId = 1;
 
   const totalPages = $derived(Math.max(1, Math.ceil(images.total / images.per_page)));
   const processedStates = $derived(
@@ -97,14 +128,17 @@
         await Promise.all([loadOverview(), loadImages(), loadSettings()]);
       }
     } catch (error) {
-      authError = error instanceof Error ? error.message : 'Could not reach Aedos';
+      notify(error instanceof Error ? error.message : 'Could not reach Aedos', 'error');
     } finally {
       loading = false;
     }
   }
 
   async function authenticate() {
-    authError = '';
+    if (session.needs_setup && password !== confirmPassword) {
+      notify('Passwords do not match', 'error');
+      return;
+    }
     try {
       const path = session.needs_setup ? '/admin/api/setup' : '/admin/api/login';
       await api(path, {
@@ -112,9 +146,10 @@
         body: JSON.stringify({ username, password })
       });
       password = '';
+      confirmPassword = '';
       await loadSession();
     } catch (error) {
-      authError = error instanceof Error ? error.message : 'Authentication failed';
+      notify(error instanceof Error ? error.message : 'Authentication failed', 'error');
     }
   }
 
@@ -158,30 +193,49 @@
 
   async function saveReview() {
     if (!selected) return;
-    await api(`/admin/api/images/${selected.sha256}/verdict`, {
-      method: 'POST',
-      body: JSON.stringify({
-        status: reviewStatus,
-        labels: reviewLabels.split(',').map((label) => label.trim()).filter(Boolean),
-        confidence: Number(reviewConfidence),
-        explanation: reviewExplanation.trim() || null
-      })
-    });
-    message = 'Verdict updated';
-    selected = null;
-    await Promise.all([loadOverview(), loadImages()]);
+    try {
+      await api(`/admin/api/images/${selected.sha256}/verdict`, {
+        method: 'POST',
+        body: JSON.stringify({
+          status: reviewStatus,
+          labels: reviewLabels.split(',').map((label) => label.trim()).filter(Boolean),
+          confidence: Number(reviewConfidence),
+          explanation: reviewExplanation.trim() || null
+        })
+      });
+      notify('Verdict updated', 'success');
+      selected = null;
+      await Promise.all([loadOverview(), loadImages()]);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Could not update verdict', 'error');
+    }
   }
 
   async function saveSettings() {
     const body = {
       settings: Object.fromEntries(settings.map((setting) => [setting.key, setting.value]))
     };
-    await api('/admin/api/settings', {
-      method: 'POST',
-      body: JSON.stringify(body)
-    });
-    message = 'Settings saved';
-    await loadSettings();
+    try {
+      await api('/admin/api/settings', {
+        method: 'POST',
+        body: JSON.stringify(body)
+      });
+      notify('Settings saved', 'success');
+      await loadSettings();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : 'Could not save settings', 'error');
+    }
+  }
+
+  function notify(message: string, tone: Toast['tone'] = 'info') {
+    const id = nextToastId;
+    nextToastId += 1;
+    toasts = [...toasts, { id, message, tone }];
+    setTimeout(() => dismissToast(id), 3500);
+  }
+
+  function dismissToast(id: number) {
+    toasts = toasts.filter((toast) => toast.id !== id);
   }
 
   function formatBytes(value: number | null) {
@@ -219,7 +273,12 @@
           Password
           <input bind:value={password} type="password" autocomplete={session.needs_setup ? 'new-password' : 'current-password'} required minlength="12" />
         </label>
-        {#if authError}<p class="error">{authError}</p>{/if}
+        {#if session.needs_setup}
+          <label>
+            Confirm Password
+            <input bind:value={confirmPassword} type="password" autocomplete="new-password" required minlength="12" />
+          </label>
+        {/if}
         <button type="submit">{session.needs_setup ? 'Create Account' : 'Enter Dashboard'}</button>
       </form>
     </section>
@@ -243,10 +302,6 @@
     </aside>
 
     <section class="content">
-      {#if message}
-        <button class="toast" onclick={() => (message = '')}>{message}</button>
-      {/if}
-
       {#if activeView === 'dashboard'}
         <div class="page-head">
           <div>
@@ -294,6 +349,25 @@
               <strong>{count}</strong>
             </div>
           {/each}
+        </section>
+
+        <section class="relay-panel">
+          <header>
+            <span>Nostr Relays</span>
+            <strong>{overview?.relays?.filter((relay) => relay.online).length ?? 0}/{overview?.relays?.length ?? 0}</strong>
+          </header>
+          <div class="relay-list">
+            {#each overview?.relays ?? [] as relay}
+              <div class="relay-row" title={relay.error ?? 'websocket connected'}>
+                <span class={`relay-dot ${relay.online ? 'online' : ''}`}></span>
+                <span class="relay-url">{relay.url}</span>
+                <span class={relay.online ? 'relay-state online' : 'relay-state'}>{relay.online ? 'online' : 'offline'}</span>
+              </div>
+            {/each}
+            {#if !overview?.relays?.length}
+              <p class="empty">No relays configured</p>
+            {/if}
+          </div>
         </section>
       {:else if activeView === 'images'}
         <div class="page-head">
@@ -367,6 +441,9 @@
             <label>
               <span>{setting.key}</span>
               <input bind:value={setting.value} type={setting.secret ? 'password' : 'text'} autocomplete="off" />
+              {#if settingHints[setting.key]}
+                <small>{settingHints[setting.key]}</small>
+              {/if}
             </label>
           {/each}
         </section>
@@ -410,6 +487,16 @@
       </section>
     {/if}
   </main>
+{/if}
+
+{#if toasts.length}
+  <aside class="toast-stack" aria-live="polite" aria-label="Notifications">
+    {#each toasts as toast (toast.id)}
+      <button class={`toast ${toast.tone}`} onclick={() => dismissToast(toast.id)}>
+        {toast.message}
+      </button>
+    {/each}
+  </aside>
 {/if}
 
 <style>
@@ -468,6 +555,14 @@
     text-transform: uppercase;
   }
 
+  label small {
+    color: #8d8d8d;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.4;
+    text-transform: none;
+  }
+
   .auth-shell {
     min-height: 100vh;
     display: grid;
@@ -481,6 +576,11 @@
     border-radius: 4px;
     padding: 32px;
     background: #080808;
+  }
+
+  .auth-panel .brand {
+    text-align: center;
+    padding-left: 8px;
   }
 
   .auth-panel form {
@@ -584,7 +684,7 @@
     margin-bottom: 18px;
   }
 
-  .stats-grid article, .status-band, .table-shell, .settings-grid, .modal {
+  .stats-grid article, .status-band, .relay-panel, .table-shell, .settings-grid, .modal {
     border: 1px solid #2b2b2b;
     border-radius: 4px;
     background: #050505;
@@ -616,6 +716,72 @@
     border-right: 1px solid #202020;
     display: grid;
     gap: 8px;
+  }
+
+  .relay-panel {
+    margin-top: 18px;
+    overflow: hidden;
+  }
+
+  .relay-panel header {
+    min-height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 0 18px;
+    border-bottom: 1px solid #1d1d1d;
+  }
+
+  .relay-panel header span,
+  .relay-state {
+    color: #aaa;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  .relay-list {
+    display: grid;
+  }
+
+  .relay-row {
+    min-height: 46px;
+    display: grid;
+    grid-template-columns: 12px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 12px;
+    padding: 0 18px;
+    border-bottom: 1px solid #171717;
+  }
+
+  .relay-row:last-child {
+    border-bottom: 0;
+  }
+
+  .relay-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #b44242;
+    box-shadow: 0 0 0 3px rgba(180, 66, 66, 0.16);
+  }
+
+  .relay-dot.online {
+    background: #44d56f;
+    box-shadow: 0 0 0 3px rgba(68, 213, 111, 0.16);
+  }
+
+  .relay-url {
+    min-width: 0;
+    overflow: hidden;
+    color: #f1f1f1;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .relay-state.online {
+    color: #8bf0a5;
   }
 
   .search {
@@ -739,11 +905,35 @@
     gap: 12px;
   }
 
-  .toast {
+  .toast-stack {
     position: fixed;
-    right: 18px;
-    top: 78px;
-    z-index: 2;
+    right: 24px;
+    bottom: 24px;
+    z-index: 10;
+    width: min(380px, calc(100vw - 32px));
+    display: grid;
+    gap: 10px;
+  }
+
+  .toast {
+    min-height: 44px;
+    width: 100%;
+    border-color: #555;
+    background: #101010;
+    color: #f4f4f4;
+    padding: 11px 14px;
+    text-align: left;
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+  }
+
+  .toast.success {
+    border-color: #2b8a4b;
+    color: #8bf0a5;
+  }
+
+  .toast.error {
+    border-color: #a33;
+    color: #ff9b9b;
   }
 
   .error, .empty {
@@ -798,6 +988,12 @@
 
     .search {
       grid-template-columns: 1fr;
+    }
+
+    .toast-stack {
+      right: 16px;
+      bottom: 16px;
+      width: calc(100vw - 32px);
     }
 
     th:nth-child(2), td:nth-child(2), th:nth-child(4), td:nth-child(4), th:nth-child(5), td:nth-child(5) {
