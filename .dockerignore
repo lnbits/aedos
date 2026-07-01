@@ -1,0 +1,12 @@
+.git
+target
+nips
+apps/dashboard/node_modules
+apps/dashboard/.svelte-kit
+apps/dashboard/build
+workers/python/.venv
+workers/python/.pytest_cache
+**/__pycache__
+**/*.pyc
+.env
+.env.*

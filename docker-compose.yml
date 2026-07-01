@@ -56,5 +56,17 @@ services:
       redis:
         condition: service_healthy
 
+  dashboard:
+    build:
+      context: apps/dashboard
+    environment:
+      ORACLE_BASE_URL: http://oracle:8080
+      HOST: 0.0.0.0
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - oracle
+
 volumes:
   postgres_data:

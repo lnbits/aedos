@@ -6,6 +6,11 @@ nips/
 
 target/
 
+node_modules/
+.svelte-kit/
+build/
+apps/dashboard/.env
+
 __pycache__/
 *.py[cod]
 .pytest_cache/

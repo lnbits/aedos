@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
+import time
 import uuid
 from io import BytesIO
 from typing import Any
@@ -10,6 +12,7 @@ from typing import Any
 import asyncpg
 import httpx
 import redis.asyncio as redis
+from redis.exceptions import ResponseError, TimeoutError as RedisTimeoutError
 from PIL import Image
 
 from hashing import fingerprint_image
@@ -18,6 +21,32 @@ from providers import create_moderation_model
 
 
 JOB_QUEUE = "oracle:analysis"
+RETRY_QUEUE = "oracle:analysis:retry"
+DEAD_LETTER_QUEUE = "oracle:analysis:dead"
+QUEUE_GROUP = "aedos-workers"
+QUEUE_CONSUMER = f"{socket.gethostname()}:{os.getpid()}"
+QUEUE_POLL_SECONDS = 5
+MAX_JOB_ATTEMPTS = 5
+BASE_RETRY_SECONDS = 10
+MAX_RETRY_SECONDS = 300
+PENDING_IDLE_MS = 60_000
+RECOVER_PENDING_COUNT = 10
+DEFAULT_STREAM_MAXLEN = 1_000_000
+DEFAULT_DEAD_LETTER_MAXLEN = 100_000
+RUNTIME_SETTING_KEYS = {
+    "MAX_IMAGE_BYTES",
+    "IMAGE_FETCH_TIMEOUT_SECONDS",
+    "QUEUE_STREAM_MAXLEN",
+    "QUEUE_DEAD_LETTER_MAXLEN",
+    "MODERATION_PROVIDER",
+    "OPENAI_API_KEY",
+    "OPENAI_MODERATION_MODEL",
+}
+PROVIDER_SETTING_KEYS = {
+    "MODERATION_PROVIDER",
+    "OPENAI_API_KEY",
+    "OPENAI_MODERATION_MODEL",
+}
 
 
 def env_int(name: str, default: int) -> int:
@@ -25,6 +54,65 @@ def env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def setting_str(settings: dict[str, str], name: str, default: str = "") -> str:
+    return settings.get(name) or os.getenv(name, default)
+
+
+def setting_int(settings: dict[str, str], name: str, default: int) -> int:
+    try:
+        return int(setting_str(settings, name, str(default)))
+    except ValueError:
+        return default
+
+
+def env_str(name: str, default: str) -> str:
+    return os.getenv(name, default).strip() or default
+
+
+def job_attempts(job: dict[str, Any]) -> int:
+    try:
+        return int(job.get("attempts", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def retry_delay_seconds(attempts: int) -> int:
+    delay = BASE_RETRY_SECONDS * (2 ** max(attempts - 1, 0))
+    return min(delay, MAX_RETRY_SECONDS)
+
+
+def with_failure_metadata(job: dict[str, Any], error: Exception) -> dict[str, Any]:
+    updated = dict(job)
+    updated["attempts"] = job_attempts(job) + 1
+    updated["last_error"] = str(error)
+    updated["last_error_type"] = type(error).__name__
+    updated["last_failed_at"] = int(time.time())
+    return updated
+
+
+async def xadd_payload(redis_client: redis.Redis, stream: str, payload: str, *, maxlen: int) -> None:
+    await redis_client.xadd(stream, {"payload": payload}, maxlen=maxlen, approximate=True)
+
+
+async def load_runtime_settings(conn: asyncpg.Connection) -> dict[str, str]:
+    try:
+        rows = await conn.fetch(
+            """
+            select key, value
+            from admin_settings
+            where key = any($1::text[])
+            """,
+            sorted(RUNTIME_SETTING_KEYS),
+        )
+    except asyncpg.UndefinedTableError:
+        return {}
+    return {row["key"]: row["value"] for row in rows}
+
+
+def provider_signature(settings: dict[str, str]) -> tuple[str, str, str]:
+    return tuple(setting_str(settings, key).strip() for key in sorted(PROVIDER_SETTING_KEYS))
 
 
 async def fetch_image(url: str, max_bytes: int, timeout_seconds: int) -> tuple[bytes, str]:
@@ -136,18 +224,36 @@ async def store_emergency_escalation(
     )
 
 
+async def store_event_stub(conn: asyncpg.Connection, *, event_id: str) -> None:
+    await conn.execute(
+        """
+        insert into events (id, content, raw, created_at)
+        values ($1, '', '{}'::jsonb, extract(epoch from now())::bigint)
+        on conflict (id) do nothing
+        """,
+        event_id,
+    )
+
+
 async def store_image_metadata(
     conn: asyncpg.Connection,
     *,
     url: str,
     fingerprint: Any,
-) -> None:
-    await conn.execute(
+) -> str:
+    image_id = await conn.fetchval(
         """
         insert into images
         (id, url, normalized_url, sha256, phash, mime_type, width, height, bytes)
         values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-        on conflict (sha256) do nothing
+        on conflict (sha256) do update set
+          url = excluded.url,
+          normalized_url = excluded.normalized_url,
+          mime_type = excluded.mime_type,
+          width = excluded.width,
+          height = excluded.height,
+          bytes = excluded.bytes
+        returning id
         """,
         uuid.uuid4(),
         url,
@@ -159,6 +265,19 @@ async def store_image_metadata(
         fingerprint.height,
         fingerprint.bytes,
     )
+    return str(image_id)
+
+
+async def link_event_image(conn: asyncpg.Connection, *, event_id: str, image_id: str) -> None:
+    await conn.execute(
+        """
+        insert into event_images (event_id, image_id)
+        values ($1, $2)
+        on conflict do nothing
+        """,
+        event_id,
+        image_id,
+    )
 
 
 async def process_job(
@@ -169,10 +288,12 @@ async def process_job(
     timeout_seconds: int,
 ) -> None:
     event_id = job["event_id"]
+    await store_event_stub(conn, event_id=event_id)
     for url in job.get("image_urls", []):
         payload, mime_type = await fetch_image(url, max_bytes=max_bytes, timeout_seconds=timeout_seconds)
         fingerprint = fingerprint_image(payload, mime_type)
-        await store_image_metadata(conn, url=url, fingerprint=fingerprint)
+        image_id = await store_image_metadata(conn, url=url, fingerprint=fingerprint)
+        await link_event_image(conn, event_id=event_id, image_id=image_id)
 
         verdict = await latest_verdict(conn, target_type="image", target_id=fingerprint.sha256)
         cache_hit = verdict is not None
@@ -203,19 +324,190 @@ async def process_job(
             )
 
 
+async def ensure_consumer_group(redis_client: redis.Redis, stream: str, group: str) -> None:
+    try:
+        await redis_client.xgroup_create(stream, group, id="0", mkstream=True)
+    except ResponseError as exc:
+        if "BUSYGROUP" not in str(exc):
+            raise
+
+
+async def move_due_retries(
+    redis_client: redis.Redis,
+    *,
+    stream_maxlen: int,
+    now: float | None = None,
+    limit: int = 100,
+) -> int:
+    now = time.time() if now is None else now
+    payloads = await redis_client.zrangebyscore(RETRY_QUEUE, 0, now, start=0, num=limit)
+    moved = 0
+    for payload in payloads:
+        removed = await redis_client.zrem(RETRY_QUEUE, payload)
+        if removed:
+            await xadd_payload(redis_client, JOB_QUEUE, payload, maxlen=stream_maxlen)
+            moved += 1
+    return moved
+
+
+async def read_job(redis_client: redis.Redis, *, group: str, consumer: str) -> tuple[str, dict[str, Any]] | None:
+    entries = await redis_client.xreadgroup(
+        groupname=group,
+        consumername=consumer,
+        streams={JOB_QUEUE: ">"},
+        count=1,
+        block=QUEUE_POLL_SECONDS * 1000,
+    )
+    if not entries:
+        return None
+    _, messages = entries[0]
+    message_id, fields = messages[0]
+    return message_id, json.loads(fields["payload"])
+
+
+async def ack_job(redis_client: redis.Redis, *, group: str, message_id: str) -> None:
+    await redis_client.xack(JOB_QUEUE, group, message_id)
+
+
+async def retry_or_dead_letter(
+    redis_client: redis.Redis,
+    *,
+    group: str,
+    message_id: str,
+    job: dict[str, Any],
+    error: Exception,
+    dead_letter_maxlen: int,
+) -> None:
+    failed_job = with_failure_metadata(job, error)
+    if job_attempts(failed_job) >= MAX_JOB_ATTEMPTS:
+        await xadd_payload(
+            redis_client,
+            DEAD_LETTER_QUEUE,
+            json.dumps(failed_job),
+            maxlen=dead_letter_maxlen,
+        )
+    else:
+        available_at = time.time() + retry_delay_seconds(job_attempts(failed_job))
+        await redis_client.zadd(RETRY_QUEUE, {json.dumps(failed_job): available_at})
+    await redis_client.xack(JOB_QUEUE, group, message_id)
+
+
+async def reclaim_stale_jobs(redis_client: redis.Redis, *, group: str, consumer: str) -> list[tuple[str, dict[str, Any]]]:
+    try:
+        response = await redis_client.execute_command(
+            "XAUTOCLAIM",
+            JOB_QUEUE,
+            group,
+            consumer,
+            PENDING_IDLE_MS,
+            "0-0",
+            "COUNT",
+            RECOVER_PENDING_COUNT,
+        )
+    except ResponseError:
+        return []
+    if len(response) < 2:
+        return []
+    reclaimed = []
+    for message_id, fields in response[1]:
+        if "payload" in fields:
+            reclaimed.append((message_id, json.loads(fields["payload"])))
+    return reclaimed
+
+
+async def process_stream_job(
+    redis_client: redis.Redis,
+    conn: asyncpg.Connection,
+    model: ModerationModel,
+    *,
+    group: str,
+    message_id: str,
+    job: dict[str, Any],
+    max_bytes: int,
+    timeout_seconds: int,
+    dead_letter_maxlen: int,
+) -> None:
+    try:
+        await process_job(conn, job, model, max_bytes, timeout_seconds)
+    except Exception as exc:
+        await retry_or_dead_letter(
+            redis_client,
+            group=group,
+            message_id=message_id,
+            job=job,
+            error=exc,
+            dead_letter_maxlen=dead_letter_maxlen,
+        )
+    else:
+        await ack_job(redis_client, group=group, message_id=message_id)
+
+
 async def run_worker() -> None:
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     database_url = os.getenv("DATABASE_URL", "postgresql://oracle:oracle@localhost:5432/oracle")
-    max_bytes = env_int("MAX_IMAGE_BYTES", 10_000_000)
-    timeout_seconds = env_int("IMAGE_FETCH_TIMEOUT_SECONDS", 10)
+    group = env_str("QUEUE_CONSUMER_GROUP", QUEUE_GROUP)
+    consumer = env_str("QUEUE_CONSUMER_NAME", QUEUE_CONSUMER)
 
-    redis_client = redis.from_url(redis_url, decode_responses=True)
+    redis_client = redis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=10,
+        socket_timeout=QUEUE_POLL_SECONDS + 10,
+    )
     conn = await asyncpg.connect(database_url)
-    model = create_moderation_model()
+    settings = await load_runtime_settings(conn)
+    model_signature = provider_signature(settings)
+    model = create_moderation_model(settings)
+    await ensure_consumer_group(redis_client, JOB_QUEUE, group)
 
     while True:
-        _, payload = await redis_client.blpop(JOB_QUEUE)
-        await process_job(conn, json.loads(payload), model, max_bytes, timeout_seconds)
+        settings = await load_runtime_settings(conn)
+        next_model_signature = provider_signature(settings)
+        if next_model_signature != model_signature:
+            try:
+                model = create_moderation_model(settings)
+                model_signature = next_model_signature
+            except Exception:
+                pass
+
+        max_bytes = setting_int(settings, "MAX_IMAGE_BYTES", 10_000_000)
+        timeout_seconds = setting_int(settings, "IMAGE_FETCH_TIMEOUT_SECONDS", 10)
+        stream_maxlen = setting_int(settings, "QUEUE_STREAM_MAXLEN", DEFAULT_STREAM_MAXLEN)
+        dead_letter_maxlen = setting_int(settings, "QUEUE_DEAD_LETTER_MAXLEN", DEFAULT_DEAD_LETTER_MAXLEN)
+
+        await move_due_retries(redis_client, stream_maxlen=stream_maxlen)
+        stale_jobs = await reclaim_stale_jobs(redis_client, group=group, consumer=consumer)
+        for message_id, job in stale_jobs:
+            await process_stream_job(
+                redis_client,
+                conn,
+                model,
+                group=group,
+                message_id=message_id,
+                job=job,
+                max_bytes=max_bytes,
+                timeout_seconds=timeout_seconds,
+                dead_letter_maxlen=dead_letter_maxlen,
+            )
+        try:
+            result = await read_job(redis_client, group=group, consumer=consumer)
+        except RedisTimeoutError:
+            await asyncio.sleep(1)
+            continue
+        if result is None:
+            continue
+        message_id, job = result
+        await process_stream_job(
+            redis_client,
+            conn,
+            model,
+            group=group,
+            message_id=message_id,
+            job=job,
+            max_bytes=max_bytes,
+            timeout_seconds=timeout_seconds,
+            dead_letter_maxlen=dead_letter_maxlen,
+        )
 
 
 if __name__ == "__main__":

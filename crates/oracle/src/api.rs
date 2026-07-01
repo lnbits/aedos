@@ -12,11 +12,12 @@ use serde_json::{json, Value};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
+    admin,
     config::Config,
     db::Store,
     images::{extract_image_urls, normalize_image_url},
     metrics::Metrics,
-    queue::{AnalysisJob, Queue},
+    queue::{AnalysisJob, Queue, DEFAULT_STREAM_MAXLEN},
     types::{BatchCheckRequest, BatchEvent, CheckRequest, SubmitRequest, TargetType, Verdict, VerdictResponse},
     websocket::ws_handler,
 };
@@ -31,6 +32,7 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .merge(admin::router())
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/check", post(check))
@@ -56,6 +58,7 @@ async fn metrics(State(state): State<AppState>) -> String {
 }
 
 async fn check(State(state): State<AppState>, Json(req): Json<CheckRequest>) -> Result<Json<VerdictResponse>, ApiError> {
+    admin::check_rate_limit(&state, "public:check", "RATE_LIMIT_CHECKS_PER_MINUTE", 120).await?;
     let event = BatchEvent {
         event_id: req.event_id,
         image_urls: req.image_urls,
@@ -65,6 +68,7 @@ async fn check(State(state): State<AppState>, Json(req): Json<CheckRequest>) -> 
 }
 
 async fn submit(State(state): State<AppState>, Json(req): Json<SubmitRequest>) -> Result<Json<Vec<VerdictResponse>>, ApiError> {
+    admin::check_rate_limit(&state, "public:submit", "RATE_LIMIT_CHECKS_PER_MINUTE", 120).await?;
     let event_id = req.event_id.unwrap_or_else(|| "manual-submit".to_string());
     let mut image_urls = req.image_urls;
     if let Some(raw_event) = req.raw_event {
@@ -82,6 +86,7 @@ async fn check_batch(
     State(state): State<AppState>,
     Json(req): Json<BatchCheckRequest>,
 ) -> Result<Json<Vec<VerdictResponse>>, ApiError> {
+    admin::check_rate_limit(&state, "public:check_batch", "RATE_LIMIT_CHECKS_PER_MINUTE", 120).await?;
     let mut responses = Vec::with_capacity(req.events.len());
     for event in req.events {
         let verdict = check_or_enqueue(&state, &event).await?;
@@ -126,15 +131,34 @@ pub async fn check_or_enqueue(state: &AppState, event: &BatchEvent) -> Result<Ve
     if !image_urls.is_empty() {
         state
             .queue
-            .enqueue(&AnalysisJob {
-                event_id: event.event_id.clone(),
-                image_urls,
-            })
+            .enqueue(
+                &AnalysisJob {
+                    event_id: event.event_id.clone(),
+                    image_urls,
+                },
+                queue_stream_maxlen(state).await,
+            )
             .await?;
         state.metrics.queued_jobs.fetch_add(1, Ordering::Relaxed);
     }
 
     Ok(Verdict::unknown(TargetType::Event, event.event_id.clone()))
+}
+
+async fn queue_stream_maxlen(state: &AppState) -> usize {
+    state
+        .store
+        .admin_setting_value("QUEUE_STREAM_MAXLEN")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            std::env::var("QUEUE_STREAM_MAXLEN")
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(DEFAULT_STREAM_MAXLEN)
 }
 
 fn extract_urls_from_raw_event(raw_event: &Value) -> Vec<String> {
@@ -165,6 +189,15 @@ impl From<anyhow::Error> for ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: value.to_string(),
+        }
+    }
+}
+
+impl From<admin::AdminError> for ApiError {
+    fn from(value: admin::AdminError) -> Self {
+        Self {
+            status: value.status,
+            message: value.message,
         }
     }
 }

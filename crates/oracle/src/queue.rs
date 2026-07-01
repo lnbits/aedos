@@ -1,9 +1,10 @@
 use anyhow::Result;
-use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::types::{BatchEvent, Verdict};
+
+pub const DEFAULT_STREAM_MAXLEN: usize = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AnalysisJob {
@@ -41,11 +42,20 @@ impl Queue {
         Self { redis: None, verdict_tx }
     }
 
-    pub async fn enqueue(&self, job: &AnalysisJob) -> Result<()> {
+    pub async fn enqueue(&self, job: &AnalysisJob, stream_maxlen: usize) -> Result<()> {
         if let Some(client) = &self.redis {
             let mut conn = client.get_multiplexed_async_connection().await?;
             let payload = serde_json::to_string(job)?;
-            let _: () = conn.rpush("oracle:analysis", payload).await?;
+            let _: String = redis::cmd("XADD")
+                .arg("oracle:analysis")
+                .arg("MAXLEN")
+                .arg("~")
+                .arg(stream_maxlen)
+                .arg("*")
+                .arg("payload")
+                .arg(payload)
+                .query_async(&mut conn)
+                .await?;
         }
         Ok(())
     }

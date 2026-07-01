@@ -26,6 +26,25 @@ impl Store {
         })
     }
 
+    pub fn pool(&self) -> Option<&PgPool> {
+        self.pool.as_ref()
+    }
+
+    pub async fn admin_setting_value(&self, key: &str) -> Result<Option<String>> {
+        let Some(pool) = &self.pool else {
+            return Ok(None);
+        };
+        match sqlx::query_scalar::<_, String>("select value from admin_settings where key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(sqlx::Error::Database(err)) if err.code().as_deref() == Some("42P01") => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn memory() -> Self {
         Self {
             pool: None,
