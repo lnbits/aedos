@@ -1,4 +1,4 @@
-# <img width="30px" src="https://github.com/user-attachments/assets/259e50cb-fd73-4218-8a29-360293828186">Aedos
+# <img width="60px" src="https://github.com/user-attachments/assets/259e50cb-fd73-4218-8a29-360293828186"> Aedos
 
 `aedos` is an AI-powered moderation oracle for Nostr. It checks images and events, caches the result, and publishes signed moderation labels that clients and relays can choose to trust.
 
