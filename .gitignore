@@ -2,6 +2,8 @@
 .env.*
 !.env.example
 
+nips/
+
 target/
 
 __pycache__/
