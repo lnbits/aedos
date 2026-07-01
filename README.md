@@ -1,4 +1,4 @@
-# aedos
+# Aedos
 
 `aedos` is a Nostr-native moderation label oracle for images and events. It is shaped as long-term infrastructure: cache-first, self-hostable, AI-provider agnostic, and useful through Nostr even when HTTP or WebSockets are disabled.
 
