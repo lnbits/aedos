@@ -13,7 +13,8 @@ import redis.asyncio as redis
 from PIL import Image
 
 from hashing import fingerprint_image
-from moderation import DeterministicModerationModel, ModerationModel, Verdict
+from moderation import ModerationModel, Verdict
+from providers import create_moderation_model
 
 
 JOB_QUEUE = "oracle:analysis"
@@ -41,7 +42,47 @@ async def fetch_image(url: str, max_bytes: int, timeout_seconds: int) -> tuple[b
             return b"".join(chunks), mime_type
 
 
-async def store_verdict(conn: asyncpg.Connection, event_id: str, verdict: Verdict) -> None:
+async def latest_verdict(
+    conn: asyncpg.Connection,
+    *,
+    target_type: str,
+    target_id: str,
+) -> Verdict | None:
+    row = await conn.fetchrow(
+        """
+        select status, labels, confidence, source, model_version, explanation
+        from verdicts
+        where target_type = $1 and target_id = $2
+        order by created_at desc
+        limit 1
+        """,
+        target_type,
+        target_id,
+    )
+    if row is None:
+        return None
+
+    labels = row["labels"]
+    if isinstance(labels, str):
+        labels = json.loads(labels)
+    return Verdict(
+        status=row["status"],
+        labels=list(labels),
+        confidence=float(row["confidence"]),
+        source=row["source"],
+        model_version=row["model_version"],
+        explanation=row["explanation"],
+    )
+
+
+async def store_verdict(
+    conn: asyncpg.Connection,
+    *,
+    target_type: str,
+    target_id: str,
+    verdict: Verdict,
+    cache: bool = False,
+) -> None:
     await conn.execute(
         """
         insert into verdicts
@@ -50,8 +91,8 @@ async def store_verdict(conn: asyncpg.Connection, event_id: str, verdict: Verdic
         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13,$14,$15)
         """,
         uuid.uuid4(),
-        "event",
-        event_id,
+        target_type,
+        target_id,
         verdict.status,
         verdict.safe,
         verdict.warn,
@@ -61,7 +102,7 @@ async def store_verdict(conn: asyncpg.Connection, event_id: str, verdict: Verdic
         json.dumps(verdict.labels),
         verdict.confidence,
         verdict.source,
-        False,
+        cache,
         verdict.model_version,
         verdict.explanation,
     )
@@ -95,6 +136,31 @@ async def store_emergency_escalation(
     )
 
 
+async def store_image_metadata(
+    conn: asyncpg.Connection,
+    *,
+    url: str,
+    fingerprint: Any,
+) -> None:
+    await conn.execute(
+        """
+        insert into images
+        (id, url, normalized_url, sha256, phash, mime_type, width, height, bytes)
+        values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        on conflict (sha256) do nothing
+        """,
+        uuid.uuid4(),
+        url,
+        url,
+        fingerprint.sha256,
+        fingerprint.phash,
+        fingerprint.mime_type,
+        fingerprint.width,
+        fingerprint.height,
+        fingerprint.bytes,
+    )
+
+
 async def process_job(
     conn: asyncpg.Connection,
     job: dict[str, Any],
@@ -106,28 +172,27 @@ async def process_job(
     for url in job.get("image_urls", []):
         payload, mime_type = await fetch_image(url, max_bytes=max_bytes, timeout_seconds=timeout_seconds)
         fingerprint = fingerprint_image(payload, mime_type)
+        await store_image_metadata(conn, url=url, fingerprint=fingerprint)
 
-        image = Image.open(BytesIO(payload))
-        verdict = model.analyse(image)
+        verdict = await latest_verdict(conn, target_type="image", target_id=fingerprint.sha256)
+        cache_hit = verdict is not None
+        if verdict is None:
+            image = Image.open(BytesIO(payload))
+            verdict = await model.analyse(image, payload, mime_type)
+            await store_verdict(
+                conn,
+                target_type="image",
+                target_id=fingerprint.sha256,
+                verdict=verdict,
+            )
 
-        await conn.execute(
-            """
-            insert into images
-            (id, url, normalized_url, sha256, phash, mime_type, width, height, bytes)
-            values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-            on conflict (sha256) do nothing
-            """,
-            uuid.uuid4(),
-            url,
-            url,
-            fingerprint.sha256,
-            fingerprint.phash,
-            fingerprint.mime_type,
-            fingerprint.width,
-            fingerprint.height,
-            fingerprint.bytes,
+        await store_verdict(
+            conn,
+            target_type="event",
+            target_id=event_id,
+            verdict=verdict,
+            cache=cache_hit,
         )
-        await store_verdict(conn, event_id, verdict)
         if verdict.requires_emergency_escalation:
             await store_emergency_escalation(
                 conn,
@@ -146,7 +211,7 @@ async def run_worker() -> None:
 
     redis_client = redis.from_url(redis_url, decode_responses=True)
     conn = await asyncpg.connect(database_url)
-    model = DeterministicModerationModel()
+    model = create_moderation_model()
 
     while True:
         _, payload = await redis_client.blpop(JOB_QUEUE)

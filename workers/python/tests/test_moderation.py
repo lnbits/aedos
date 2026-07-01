@@ -5,8 +5,12 @@ from PIL import Image
 from moderation import DeterministicModerationModel, csam_suspected_verdict
 
 
-def test_default_model_is_swappable_safe_baseline() -> None:
-    verdict = DeterministicModerationModel().analyse(Image.new("RGB", (8, 8), "white"))
+async def test_default_model_is_swappable_safe_baseline() -> None:
+    verdict = await DeterministicModerationModel().analyse(
+        Image.new("RGB", (8, 8), "white"),
+        b"payload",
+        "image/png",
+    )
 
     assert verdict.status == "safe"
     assert verdict.labels == ["safe"]

@@ -30,7 +30,7 @@ services:
     build:
       context: .
       dockerfile: crates/oracle/Dockerfile
-    env_file: .env.example
+    env_file: .env
     environment:
       DATABASE_URL: postgres://oracle:oracle@postgres:5432/oracle
       REDIS_URL: redis://redis:6379/0
@@ -46,7 +46,7 @@ services:
   worker:
     build:
       context: workers/python
-    env_file: .env.example
+    env_file: .env
     environment:
       DATABASE_URL: postgresql://oracle:oracle@postgres:5432/oracle
       REDIS_URL: redis://redis:6379/0

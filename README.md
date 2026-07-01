@@ -8,13 +8,14 @@
 - Postgres schema for events, images, verdicts, reports, and published labels.
 - Redis-backed analysis queue.
 - Python worker with image download, SHA-256, perceptual hash, and a swappable moderation model interface.
+- Swappable moderation providers. The default deterministic provider is for development; `MODERATION_PROVIDER=openai` enables OpenAI image moderation.
 - NIP-32 label draft generation using kind `1985`, `L` namespace tags, matching `l` label marks, and target tags.
 - Realtime verdict event draft generation with configurable `ORACLE_VERDICT_KIND` defaulting to `31494`.
 - Emergency escalation records for `csam-suspected` verdicts. These store audit metadata such as event ID, URL, hashes, confidence, source, and status; they do not store image bytes.
 - SSRF guardrails for localhost, loopback, private, and link-local URL targets.
 - Docker Compose for Postgres, Redis, Rust oracle, and Python worker.
 
-## Run
+## Quick Start
 
 ```bash
 cp .env.example .env
@@ -29,6 +30,44 @@ curl -X POST http://localhost:8080/v1/check \
   -H 'content-type: application/json' \
   -d '{"event_id":"example","image_urls":["https://example.com/image.png"]}'
 ```
+
+By default, Aedos uses the deterministic development provider, which marks valid images as safe and does not call any external AI service.
+
+## OpenAI Image Moderation
+
+OpenAI image moderation is the easiest production reviewer to enable first. The worker sends OpenAI only new image hashes that are not already cached by Aedos.
+
+1. Create an OpenAI API key.
+
+2. Edit `.env`:
+
+```env
+MODERATION_PROVIDER=openai
+OPENAI_API_KEY=sk-...
+OPENAI_MODERATION_MODEL=omni-moderation-latest
+```
+
+3. Start Aedos:
+
+```bash
+docker compose up --build
+```
+
+4. Check health:
+
+```bash
+curl http://localhost:8080/health
+```
+
+5. Submit an image check:
+
+```bash
+curl -X POST http://localhost:8080/v1/check \
+  -H 'content-type: application/json' \
+  -d '{"event_id":"example","image_urls":["https://example.com/image.png"]}'
+```
+
+The first response may be `unknown` while the worker downloads, hashes, and reviews the image. Later calls for the same event ID return the cached event verdict. New events with an already-seen image SHA-256 reuse the cached image verdict and do not call OpenAI again.
 
 ## API
 
@@ -94,3 +133,6 @@ See `.env.example` for all settings. Important values:
 - `ORACLE_VERDICT_KIND`
 - `MAX_IMAGE_BYTES`
 - `IMAGE_FETCH_TIMEOUT_SECONDS`
+- `MODERATION_PROVIDER`
+- `OPENAI_API_KEY`
+- `OPENAI_MODERATION_MODEL`

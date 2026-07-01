@@ -50,7 +50,7 @@ def csam_suspected_verdict(
 
 
 class ModerationModel(Protocol):
-    def analyse(self, image: Image.Image) -> Verdict:
+    async def analyse(self, image: Image.Image, payload: bytes, mime_type: str) -> Verdict:
         ...
 
 
@@ -59,7 +59,8 @@ class DeterministicModerationModel:
 
     model_version = "deterministic-v0"
 
-    def analyse(self, image: Image.Image) -> Verdict:
+    async def analyse(self, image: Image.Image, payload: bytes, mime_type: str) -> Verdict:
+        _ = payload, mime_type
         if image.width < 1 or image.height < 1:
             return Verdict(
                 status="error",
