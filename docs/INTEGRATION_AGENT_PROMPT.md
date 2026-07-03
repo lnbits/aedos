@@ -13,7 +13,9 @@ Important Aedos concepts:
 - Aedos returns compact verdicts: safe, warn, block, unknown, or error.
 - Labels may include safe, nsfw, nudity, sexual, sexualised, graphic, gore, violence, weapon, self-harm, hate-symbol, spam, scam, csam-suspected, and unknown.
 - Aedos caches verdicts by event ID and media SHA-256. Do not re-send unchanged content in a tight loop.
-- Aedos can return unknown immediately while media is queued. Use wait mode or WebSockets if the integration needs the final verdict before accepting/displaying content.
+- Prefer the Aedos WebSocket API for active relay/client integrations. It lets the integration submit checks and receive final verdict updates on the same connection.
+- Use HTTP for simple one-off checks, startup probes, server environments where WebSockets are awkward, or fallback behavior.
+- Aedos can return unknown immediately while media is queued. Use WebSockets, or HTTP wait mode, if the integration needs the final verdict before accepting/displaying content.
 - If API_KEYS is configured on Aedos, pass the key as x-api-key, Authorization: Bearer <key>, or ?api_key=<key> for WebSocket connections.
 - Aedos can also publish NIP-32 label events, kind 1985, to configured Nostr relays. Prefer verified NIP-32 labels for clients/relays that already consume Nostr label events.
 
@@ -50,6 +52,14 @@ HTTP response shape:
 WebSocket endpoint:
 GET {AEDOS_WS_URL}/v1/ws
 
+Preferred WebSocket flow:
+1. Open one bounded, long-lived WebSocket connection to Aedos.
+2. Send check or check_batch messages as relay/client events arrive.
+3. Apply any immediate safe/warn/block verdict.
+4. If Aedos returns unknown, keep the event pending, quarantined, blurred, or temporarily rejected according to local policy.
+5. Keep the socket open and apply the later verdict message when Aedos finishes processing.
+6. Reconnect with backoff and resubscribe to any still-pending event IDs.
+
 Send one event:
 {"type":"check","event_id":"<event id>","npub":"<optional pubkey>","image_urls":["https://example.com/a.jpg"],"video_urls":["https://example.com/a.mp4"]}
 
@@ -72,7 +82,8 @@ Relay integration behavior:
    - image URLs
    - direct video URLs
 2. Submit the event to Aedos.
-   - If your relay must decide before storing, use wait=true with a short timeout.
+   - Prefer /v1/ws for submit-and-receive-updates behavior.
+   - If your relay must decide before storing and cannot keep a pending queue, use HTTP wait=true with a short timeout.
    - If your relay can quarantine/pending-store, accept into a pending state and consume the later WebSocket verdict.
 3. Apply policy:
    - safe: accept/store/share normally.
@@ -91,7 +102,7 @@ Relay integration behavior:
 Client integration behavior:
 1. For notes in timelines, extract event id, pubkey, image URLs, and direct video URLs.
 2. Prefer existing NIP-32 labels from trusted Aedos label pubkeys when available.
-3. If no trusted label exists, query Aedos using HTTP or WebSocket.
+3. If no trusted label exists, query Aedos using WebSockets for timeline/live updates. Use HTTP for simple fallback checks.
 4. Apply display policy:
    - safe: render normally.
    - warn labels like nsfw, nudity, sexual, sexualised, graphic, gore: blur/collapse behind a user action.

@@ -240,7 +240,8 @@ There is also a configurable realtime event draft kind, `ORACLE_VERDICT_KIND`, d
 
 Relays and clients can use Aedos in two ways:
 
-- Query the HTTP/WebSocket API directly when they see an event.
+- Query the WebSocket API directly when they see an event, which is the recommended active integration path because it can submit checks and receive later verdict updates on the same connection.
+- Use HTTP for one-off checks, simple server integrations, or fallback paths.
 - Consume NIP-32 label events from trusted Aedos label pubkeys.
 
 For a copy/paste handoff to another coding agent, use [docs/INTEGRATION_AGENT_PROMPT.md](docs/INTEGRATION_AGENT_PROMPT.md). It explains the expected relay/client behavior, API shapes, fallback policies, NIP-32 label consumption, and tests an integration should add.
