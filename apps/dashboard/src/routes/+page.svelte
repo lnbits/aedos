@@ -23,7 +23,8 @@
   };
 
   type ImageItem = {
-    sha256: string;
+    media_type: 'image' | 'video';
+    sha256: string | null;
     url: string;
     mime_type: string | null;
     width: number | null;
@@ -36,7 +37,11 @@
     source: string | null;
     model_version: string | null;
     explanation: string | null;
+    provider_response: unknown | null;
     verdict_created_at: string | null;
+    job_status: string | null;
+    job_error: string | null;
+    job_updated_at: string | null;
     event_ids: string[];
   };
 
@@ -59,13 +64,19 @@
     tone: 'success' | 'error' | 'info';
   };
 
+  type Theme = 'light' | 'dark';
+
+  const themeStorageKey = 'aedos-theme';
+
   const settingHints: Record<string, string> = {
     DEFAULT_POLICY: 'Fallback verdict when an event cannot be fully reviewed. Usually blur_unknown or block_unknown.',
     ENABLE_ESCALATION: 'Reserved for serious incident workflows. Keep false unless you have a legal/process path in place.',
-    IMAGE_FETCH_TIMEOUT_SECONDS: 'How long the worker waits when downloading an image before marking the job as failed.',
+    IMAGE_FETCH_TIMEOUT_SECONDS: 'How long the worker waits when downloading media before marking the job as failed.',
     LABEL_NAMESPACE: 'Nostr label namespace written into published moderation labels.',
     MAX_IMAGE_BYTES: 'Largest image the worker will download and review. Bigger values cost more bandwidth and AI spend.',
-    MODERATION_PROVIDER: 'Image review backend. Use deterministic for local testing or openai for OpenAI moderation.',
+    MAX_VIDEO_BYTES: 'Largest video the worker will download before sampling frames for review.',
+    MAX_VIDEO_FRAMES: 'Maximum number of video frames sampled and sent to the moderation provider.',
+    MODERATION_PROVIDER: 'Media review backend. Use deterministic for local testing or openai for OpenAI moderation.',
     NOSTR_PRIVATE_KEY: 'Secret key used to sign Aedos label events so clients and relays can verify the source.',
     NOSTR_RELAYS: 'Comma-separated relays where Aedos publishes moderation labels.',
     OPENAI_API_KEY: 'OpenAI API key used only when MODERATION_PROVIDER is set to openai.',
@@ -73,7 +84,8 @@
     QUEUE_DEAD_LETTER_MAXLEN: 'Maximum retained failed jobs in the dead-letter stream.',
     QUEUE_STREAM_MAXLEN: 'Approximate maximum retained pending/processed queue entries in Redis.',
     RATE_LIMIT_CHECKS_PER_MINUTE: 'Per-client API limit for moderation check requests.',
-    WORKER_CONCURRENCY: 'Number of images the Python worker can process in parallel.'
+    VIDEO_FRAME_INTERVAL_SECONDS: 'Seconds between sampled video frames. Lower values inspect more of each video and cost more.',
+    WORKER_CONCURRENCY: 'Number of media jobs the Python worker can process in parallel.'
   };
 
   async function api<T>(requestPath: string, options: RequestInit = {}): Promise<T> {
@@ -108,17 +120,58 @@
   let reviewLabels = $state('safe');
   let reviewConfidence = $state(1);
   let reviewExplanation = $state('');
+  let showProviderDetails = $state(false);
+  let rechecking = $state(false);
+  let recheckNotice = $state('');
   let toasts = $state<Toast[]>([]);
+  let theme = $state<Theme>('light');
   let nextToastId = 1;
 
   const totalPages = $derived(Math.max(1, Math.ceil(images.total / images.per_page)));
   const processedStates = $derived(
     overview ? Object.entries(overview.status_counts).sort(([a], [b]) => a.localeCompare(b)) : []
   );
+  const brandLogo = $derived(theme === 'light' ? '/images/logo_small_light.png' : '/images/logo_small_dark.png');
+  const hasActiveImageJobs = $derived(images.items.some((item) => isActiveJob(item.job_status)));
+  const moderationProvider = $derived(settingValue('MODERATION_PROVIDER'));
+  const hasOpenAiKey = $derived(Boolean(settingValue('OPENAI_API_KEY')));
+  const openAiReady = $derived(moderationProvider === 'openai' && hasOpenAiKey);
+  const openAiStatusTone = $derived(openAiReady ? 'ready' : moderationProvider === 'openai' ? 'error' : 'warn');
 
   $effect(() => {
+    loadTheme();
     void loadSession();
   });
+
+  $effect(() => {
+    if (!hasActiveImageJobs || !session.authenticated) return;
+    const interval = setInterval(() => {
+      void Promise.all([loadOverview(), loadImages()]).then(() => {
+        if (selected) refreshSelectedFromImages(selected);
+      });
+    }, 2500);
+    return () => clearInterval(interval);
+  });
+
+  function loadTheme() {
+    if (typeof localStorage === 'undefined') return;
+    const savedTheme = localStorage.getItem(themeStorageKey);
+    applyTheme(savedTheme === 'dark' ? 'dark' : 'light');
+  }
+
+  function applyTheme(nextTheme: Theme) {
+    theme = nextTheme;
+    if (typeof document !== 'undefined') {
+      document.documentElement.dataset.theme = nextTheme;
+    }
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(themeStorageKey, nextTheme);
+    }
+  }
+
+  function toggleTheme() {
+    applyTheme(theme === 'light' ? 'dark' : 'light');
+  }
 
   async function loadSession() {
     loading = true;
@@ -189,12 +242,18 @@
     reviewLabels = item.labels.length ? item.labels.join(', ') : reviewStatus;
     reviewConfidence = item.confidence ?? 1;
     reviewExplanation = item.explanation ?? '';
+    showProviderDetails = false;
+    recheckNotice = '';
   }
 
   async function saveReview() {
     if (!selected) return;
+    if (!selected.sha256) {
+      notify(`This URL has not been fetched and hashed yet, so there is no ${mediaName(selected)} verdict to edit.`, 'error');
+      return;
+    }
     try {
-      await api(`/admin/api/images/${selected.sha256}/verdict`, {
+      await api(`/admin/api/${mediaRoute(selected)}/${selected.sha256}/verdict`, {
         method: 'POST',
         body: JSON.stringify({
           status: reviewStatus,
@@ -209,6 +268,44 @@
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Could not update verdict', 'error');
     }
+  }
+
+  async function recheckImage() {
+    if (!selected || rechecking) return;
+    if (!selected.sha256) {
+      notify(`This URL has not been fetched yet. Try another ${mediaName(selected)} URL or wait for the fetch error to clear.`, 'error');
+      return;
+    }
+    const sha256 = selected.sha256;
+    rechecking = true;
+    recheckNotice = 'Queued. Waiting for the worker to write a fresh verdict.';
+    try {
+      await api(`/admin/api/${mediaRoute(selected)}/${sha256}/recheck`, {
+        method: 'POST',
+        body: '{}'
+      });
+      notify(`${mediaTitle(selected)} recheck queued`, 'success');
+      await Promise.all([loadOverview(), loadImages()]);
+      refreshSelectedFromImages(selected);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : `Could not queue ${mediaName(selected)} recheck`, 'error');
+      recheckNotice = '';
+    } finally {
+      rechecking = false;
+    }
+  }
+
+  function refreshSelectedFromImages(item: ImageItem) {
+    const updated = images.items.find((candidate) =>
+      item.sha256 ? candidate.sha256 === item.sha256 : candidate.url === item.url && candidate.event_ids[0] === item.event_ids[0]
+    );
+    if (!updated) return;
+    selected = updated;
+    reviewStatus = updated.status ?? 'safe';
+    reviewLabels = updated.labels.length ? updated.labels.join(', ') : reviewStatus;
+    reviewConfidence = updated.confidence ?? 1;
+    reviewExplanation = updated.explanation ?? '';
+    showProviderDetails = false;
   }
 
   async function saveSettings() {
@@ -248,6 +345,61 @@
   function short(value: string) {
     return value.length > 18 ? `${value.slice(0, 10)}...${value.slice(-6)}` : value;
   }
+
+  function reviewSourceText(item: ImageItem) {
+    if (!item.sha256 && item.job_status === 'failed') return `${mediaTitle(item)} fetch failed before AI review`;
+    if (!item.sha256) return `Waiting for ${mediaName(item)} fetch`;
+    if (item.source === 'openai_moderation') return `OpenAI reviewed this ${mediaName(item)}`;
+    if (item.source === 'local_model') return 'Local development model, not OpenAI';
+    return item.source ? `Reviewed by ${item.source}` : 'No reviewer recorded yet';
+  }
+
+  function mediaName(item: ImageItem) {
+    return item.media_type === 'video' ? 'video' : 'image';
+  }
+
+  function mediaTitle(item: ImageItem) {
+    return item.media_type === 'video' ? 'Video' : 'Image';
+  }
+
+  function mediaRoute(item: ImageItem) {
+    return item.media_type === 'video' ? 'videos' : 'images';
+  }
+
+  function isActiveJob(status: string | null) {
+    return status === 'queued' || status === 'processing' || status === 'retrying';
+  }
+
+  function jobLabel(status: string | null) {
+    if (status === 'queued') return 'Queued';
+    if (status === 'processing') return 'Processing';
+    if (status === 'retrying') return 'Retrying';
+    if (status === 'failed') return 'Failed';
+    return '';
+  }
+
+  function settingValue(key: string) {
+    return settings.find((setting) => setting.key === key)?.value.trim() ?? '';
+  }
+
+  function openAiStatusTitle() {
+    if (openAiReady) return 'OpenAI connected and ready';
+    if (moderationProvider === 'openai') return 'OpenAI selected, API key missing';
+    if (hasOpenAiKey) return 'OpenAI key saved, but not active';
+    return 'OpenAI not connected';
+  }
+
+  function openAiStatusBody() {
+    if (openAiReady) return 'Recheck with AI will use OpenAI moderation for new image reviews.';
+    if (moderationProvider === 'openai') return 'Add OPENAI_API_KEY, save settings, then recheck the image.';
+    if (hasOpenAiKey) return 'Change MODERATION_PROVIDER from deterministic to openai, save settings, then recheck the image.';
+    return 'Add OPENAI_API_KEY, set MODERATION_PROVIDER to openai, save settings, then recheck the image.';
+  }
+
+  function providerResponseText(value: unknown | null) {
+    if (!value) return '';
+    return JSON.stringify(value, null, 2);
+  }
 </script>
 
 <svelte:head>
@@ -256,13 +408,15 @@
 
 {#if loading}
   <main class="auth-shell">
-    <div class="brand">AEDOS</div>
+    <button class="theme-toggle auth-theme-toggle" type="button" onclick={toggleTheme}>{theme === 'light' ? 'Dark' : 'Light'}</button>
+    <div class="brand"><img src={brandLogo} alt="" />AEDOS</div>
     <p>Loading control surface</p>
   </main>
 {:else if !session.authenticated}
   <main class="auth-shell">
+    <button class="theme-toggle auth-theme-toggle" type="button" onclick={toggleTheme}>{theme === 'light' ? 'Dark' : 'Light'}</button>
     <section class="auth-panel">
-      <div class="brand">AEDOS</div>
+      <div class="brand"><img src={brandLogo} alt="" />AEDOS</div>
       <h1>{session.needs_setup ? 'Create Admin' : 'Sign In'}</h1>
       <form onsubmit={(event) => { event.preventDefault(); void authenticate(); }}>
         <label>
@@ -286,12 +440,13 @@
 {:else}
   <main class="app-shell">
     <header class="topbar">
-      <div class="brand">AEDOS</div>
+      <div class="brand"><img src={brandLogo} alt="" />AEDOS</div>
       <nav>
         <button class:active={activeView === 'dashboard'} onclick={() => (activeView = 'dashboard')}>Overview</button>
         <button class:active={activeView === 'images'} onclick={() => (activeView = 'images')}>Images</button>
         <button class:active={activeView === 'settings'} onclick={() => (activeView = 'settings')}>Settings</button>
       </nav>
+      <button class="theme-toggle" type="button" onclick={toggleTheme}>{theme === 'light' ? 'Dark' : 'Light'}</button>
       <button class="ghost" onclick={logout}>{session.username}</button>
     </header>
 
@@ -397,16 +552,33 @@
               {#each images.items as item}
                 <tr>
                   <td>
-                    <div class="hash">{short(item.sha256)}</div>
+                    <div class="media-type">{mediaTitle(item)}</div>
+                    <div class="hash">{item.sha256 ? short(item.sha256) : 'not fetched'}</div>
                     <div class="muted">{item.mime_type ?? 'unknown'} · {formatBytes(item.bytes)}</div>
                   </td>
                   <td>
                     <div class="events">{item.event_ids.slice(0, 2).join(', ') || '-'}</div>
                   </td>
-                  <td><span class={`pill ${item.status ?? 'unknown'}`}>{item.status ?? 'unknown'}</span></td>
+                  <td>
+                    <div class="status-cell">
+                      <span class={`pill ${item.status ?? 'unknown'}`}>{item.status ?? 'unknown'}</span>
+                      {#if isActiveJob(item.job_status)}
+                        <button class="job-detail" type="button" title={item.job_error ?? `${jobLabel(item.job_status)} ${mediaName(item)} review`} onclick={() => openReview(item)}>
+                          <span class="job-progress" aria-label={jobLabel(item.job_status)}>
+                            <span></span>
+                          </span>
+                          <small>{item.job_error ? `${jobLabel(item.job_status)}: ${item.job_error}` : jobLabel(item.job_status)}</small>
+                        </button>
+                      {:else if item.job_status === 'failed'}
+                        <button class="job-detail job-error" type="button" title={item.job_error ?? 'processing failed'} onclick={() => openReview(item)}>
+                          <small>{item.job_error ?? 'Failed'}</small>
+                        </button>
+                      {/if}
+                    </div>
+                  </td>
                   <td>{item.source ?? '-'}</td>
                   <td>{new Date(item.first_seen_at).toLocaleString()}</td>
-                  <td><button onclick={() => openReview(item)}>Review</button></td>
+                  <td><button onclick={() => openReview(item)}>{item.sha256 ? 'Review' : 'Details'}</button></td>
                 </tr>
               {/each}
               {#if images.items.length === 0}
@@ -436,15 +608,51 @@
           <button onclick={saveSettings}>Save Settings</button>
         </div>
 
+        <section class={`provider-status ${openAiStatusTone}`}>
+          <div>
+            <span>AI Provider</span>
+            <strong>{openAiStatusTitle()}</strong>
+            <p>{openAiStatusBody()}</p>
+            {#each settings as setting}
+              {#if setting.key === 'MODERATION_PROVIDER'}
+                <label class="provider-select">
+                  Active reviewer
+                  <select bind:value={setting.value}>
+                    <option value="deterministic">Local test model</option>
+                    <option value="openai">OpenAI moderation</option>
+                  </select>
+                  <small>Choose OpenAI moderation here, then save settings before rechecking images.</small>
+                </label>
+              {/if}
+            {/each}
+          </div>
+          <dl>
+            <div>
+              <dt>Provider</dt>
+              <dd>{moderationProvider || 'deterministic'}</dd>
+            </div>
+            <div>
+              <dt>OpenAI Key</dt>
+              <dd>{hasOpenAiKey ? 'saved' : 'missing'}</dd>
+            </div>
+            <div>
+              <dt>Model</dt>
+              <dd>{settingValue('OPENAI_MODERATION_MODEL') || '-'}</dd>
+            </div>
+          </dl>
+        </section>
+
         <section class="settings-grid">
           {#each settings as setting}
-            <label>
-              <span>{setting.key}</span>
-              <input bind:value={setting.value} type={setting.secret ? 'password' : 'text'} autocomplete="off" />
-              {#if settingHints[setting.key]}
-                <small>{settingHints[setting.key]}</small>
-              {/if}
-            </label>
+            {#if setting.key !== 'MODERATION_PROVIDER'}
+              <label>
+                <span>{setting.key}</span>
+                <input bind:value={setting.value} type={setting.secret ? 'password' : 'text'} autocomplete="off" />
+                {#if settingHints[setting.key]}
+                  <small>{settingHints[setting.key]}</small>
+                {/if}
+              </label>
+            {/if}
           {/each}
         </section>
       {/if}
@@ -454,9 +662,49 @@
       <button class="modal-backdrop" type="button" aria-label="Close review" onclick={() => (selected = null)}></button>
       <section class="modal-wrap" aria-modal="true" role="dialog">
         <form class="modal" onsubmit={(event) => { event.preventDefault(); void saveReview(); }}>
-          <h2>Review Image</h2>
-          <p class="hash full">{selected.sha256}</p>
+          <h2>{selected.sha256 ? `Review ${mediaTitle(selected)}` : `${mediaTitle(selected)} Job Details`}</h2>
+          <p class="hash full">{selected.sha256 ?? `${mediaTitle(selected)} was not fetched and hashed`}</p>
           <a href={selected.url} target="_blank" rel="noreferrer">{selected.url}</a>
+          <section class="review-evidence">
+            <div class:selected-ok={selected.source === 'openai_moderation'}>
+              <span>Reviewer</span>
+              <strong>{reviewSourceText(selected)}</strong>
+            </div>
+            <div>
+              <span>Source</span>
+              <strong>{selected.source ?? '-'}</strong>
+            </div>
+            <div>
+              <span>Model</span>
+              <strong>{selected.model_version ?? '-'}</strong>
+            </div>
+            <div>
+              <span>Last Verdict</span>
+              <strong>{selected.verdict_created_at ? new Date(selected.verdict_created_at).toLocaleString() : '-'}</strong>
+            </div>
+          </section>
+          {#if selected.provider_response}
+            <section class="provider-details">
+              <button class="ghost" type="button" onclick={() => (showProviderDetails = !showProviderDetails)}>
+                {showProviderDetails ? 'Hide AI Details' : 'Show AI Details'}
+              </button>
+              {#if showProviderDetails}
+                <pre>{providerResponseText(selected.provider_response)}</pre>
+              {/if}
+            </section>
+          {/if}
+          {#if recheckNotice}
+            <p class="recheck-notice">{recheckNotice}</p>
+          {/if}
+          {#if selected.job_status || selected.job_error}
+            <section class="job-summary">
+              <span>Job Status</span>
+              <strong>{jobLabel(selected.job_status) || selected.job_status || 'Completed'}</strong>
+              {#if selected.job_error}
+                <p>{selected.job_error}</p>
+              {/if}
+            </section>
+          {/if}
           <label>
             Verdict
             <select bind:value={reviewStatus}>
@@ -480,8 +728,9 @@
             <textarea bind:value={reviewExplanation}></textarea>
           </label>
           <div class="actions">
+            <button type="button" class="ghost" disabled={rechecking || !selected.sha256} onclick={recheckImage}>{rechecking ? 'Queueing...' : 'Recheck with AI'}</button>
             <button type="button" class="ghost" onclick={() => (selected = null)}>Cancel</button>
-            <button type="submit">Save Verdict</button>
+            <button type="submit" disabled={!selected.sha256}>Save Verdict</button>
           </div>
         </form>
       </section>
@@ -504,10 +753,36 @@
     box-sizing: border-box;
   }
 
+  :global(:root) {
+    --bg: #fffdf8;
+    --surface: #fffdf8;
+    --surface-active: #ece9e1;
+    --table-head: #ece9e1;
+    --text: #000;
+    --muted: #55545c;
+    --line: #55545c;
+    --danger: #8f2424;
+    --modal-backdrop: rgba(0, 0, 0, 0.38);
+    --toast-shadow: rgba(0, 0, 0, 0.18);
+  }
+
+  :global(:root[data-theme='dark']) {
+    --bg: #000;
+    --surface: #050505;
+    --surface-active: #2a2a2a;
+    --table-head: #111;
+    --text: #f5f5f5;
+    --muted: #a5a5a5;
+    --line: #55545c;
+    --danger: #ff8585;
+    --modal-backdrop: rgba(0, 0, 0, 0.72);
+    --toast-shadow: rgba(0, 0, 0, 0.45);
+  }
+
   :global(body) {
     margin: 0;
-    background: #020202;
-    color: #f4f4f4;
+    background: var(--bg);
+    color: var(--text);
     font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     letter-spacing: 0;
   }
@@ -518,10 +793,10 @@
 
   button {
     min-height: 36px;
-    border: 1px solid #6e6e6e;
+    border: 1px solid var(--line);
     border-radius: 4px;
-    background: #111;
-    color: #fff;
+    background: var(--surface);
+    color: var(--text);
     padding: 0 16px;
     font-weight: 700;
     cursor: pointer;
@@ -534,10 +809,10 @@
 
   input, select, textarea {
     width: 100%;
-    border: 1px solid #3a3a3a;
+    border: 1px solid var(--line);
     border-radius: 4px;
-    background: #070707;
-    color: #fff;
+    background: var(--surface);
+    color: var(--text);
     padding: 10px 12px;
   }
 
@@ -549,14 +824,14 @@
   label {
     display: grid;
     gap: 8px;
-    color: #b7b7b7;
+    color: var(--text);
     font-size: 12px;
     font-weight: 700;
     text-transform: uppercase;
   }
 
   label small {
-    color: #8d8d8d;
+    color: var(--muted);
     font-size: 11px;
     font-weight: 500;
     line-height: 1.4;
@@ -567,20 +842,20 @@
     min-height: 100vh;
     display: grid;
     place-items: center;
-    background: #000;
+    background: var(--bg);
   }
 
   .auth-panel {
     width: min(420px, calc(100vw - 40px));
-    border: 1px solid #2c2c2c;
+    border: 1px solid var(--line);
     border-radius: 4px;
     padding: 32px;
-    background: #080808;
+    background: var(--surface);
   }
 
   .auth-panel .brand {
+    justify-content: center;
     text-align: center;
-    padding-left: 8px;
   }
 
   .auth-panel form {
@@ -589,9 +864,29 @@
   }
 
   .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
     letter-spacing: 8px;
     font-size: 24px;
     font-weight: 900;
+  }
+
+  .brand img {
+    width: 30px;
+    height: 30px;
+    flex: 0 0 auto;
+    object-fit: contain;
+  }
+
+  .theme-toggle {
+    min-width: 74px;
+  }
+
+  .auth-theme-toggle {
+    position: fixed;
+    top: 18px;
+    right: 18px;
   }
 
   .app-shell {
@@ -599,12 +894,12 @@
     display: grid;
     grid-template-columns: 272px 1fr;
     grid-template-rows: 62px 1fr;
-    background: #000;
+    background: var(--bg);
   }
 
   .topbar {
     grid-column: 1 / -1;
-    border-bottom: 1px solid #1f1f1f;
+    border-bottom: 1px solid var(--line);
     display: flex;
     align-items: center;
     gap: 42px;
@@ -620,16 +915,16 @@
   .topbar nav button, .ghost {
     border-color: transparent;
     background: transparent;
-    color: #ddd;
+    color: var(--text);
   }
 
   .topbar nav button.active {
-    border-bottom-color: #fff;
+    border-bottom-color: var(--line);
     border-radius: 0;
   }
 
   .sidebar {
-    border-right: 1px solid #1f1f1f;
+    border-right: 1px solid var(--line);
     padding: 24px 16px;
     display: grid;
     align-content: start;
@@ -643,12 +938,12 @@
     text-align: left;
     border-color: transparent;
     background: transparent;
-    color: #a4a4a4;
+    color: var(--text);
   }
 
   .sidebar button.active {
-    background: #2b2b2b;
-    color: #fff;
+    background: var(--surface-active);
+    color: var(--text);
   }
 
   .content {
@@ -673,7 +968,7 @@
   }
 
   .eyebrow, .muted {
-    color: #8f8f8f;
+    color: var(--muted);
     font-size: 12px;
   }
 
@@ -685,9 +980,9 @@
   }
 
   .stats-grid article, .status-band, .relay-panel, .table-shell, .settings-grid, .modal {
-    border: 1px solid #2b2b2b;
+    border: 1px solid var(--line);
     border-radius: 4px;
-    background: #050505;
+    background: var(--surface);
   }
 
   .stats-grid article {
@@ -697,7 +992,7 @@
   }
 
   .stats-grid span, .status-band span {
-    color: #aaa;
+    color: var(--muted);
     font-size: 12px;
     text-transform: uppercase;
   }
@@ -713,7 +1008,7 @@
 
   .status-band div {
     padding: 18px;
-    border-right: 1px solid #202020;
+    border-right: 1px solid var(--line);
     display: grid;
     gap: 8px;
   }
@@ -730,12 +1025,12 @@
     justify-content: space-between;
     gap: 16px;
     padding: 0 18px;
-    border-bottom: 1px solid #1d1d1d;
+    border-bottom: 1px solid var(--line);
   }
 
   .relay-panel header span,
   .relay-state {
-    color: #aaa;
+    color: var(--muted);
     font-size: 12px;
     font-weight: 700;
     text-transform: uppercase;
@@ -752,7 +1047,7 @@
     align-items: center;
     gap: 12px;
     padding: 0 18px;
-    border-bottom: 1px solid #171717;
+    border-bottom: 1px solid var(--line);
   }
 
   .relay-row:last-child {
@@ -775,13 +1070,13 @@
   .relay-url {
     min-width: 0;
     overflow: hidden;
-    color: #f1f1f1;
+    color: var(--text);
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .relay-state.online {
-    color: #8bf0a5;
+    color: var(--text);
   }
 
   .search {
@@ -801,21 +1096,28 @@
 
   th, td {
     padding: 14px 12px;
-    border-bottom: 1px solid #1d1d1d;
+    border-bottom: 1px solid var(--line);
     text-align: left;
     vertical-align: middle;
     font-size: 13px;
   }
 
   th {
-    background: #151515;
-    color: #d6d6d6;
+    background: var(--table-head);
+    color: var(--text);
     font-size: 12px;
     text-transform: uppercase;
   }
 
   .hash {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  .media-type {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
   }
 
   .full {
@@ -834,16 +1136,94 @@
     place-items: center;
     min-width: 72px;
     min-height: 24px;
-    border: 1px solid #555;
+    border: 1px solid var(--line);
     border-radius: 999px;
     padding: 0 10px;
-    color: #ddd;
+    color: var(--text);
   }
 
-  .pill.safe { border-color: #2b8a4b; color: #6ee08f; }
-  .pill.warn { border-color: #b08b2e; color: #ffd166; }
-  .pill.block { border-color: #a33; color: #ff7878; }
-  .pill.error { border-color: #8b4bd1; color: #caa8ff; }
+  .pill.safe, .pill.warn, .pill.block, .pill.error {
+    border-color: var(--line);
+    color: var(--text);
+  }
+
+  .status-cell {
+    min-width: 120px;
+    display: grid;
+    gap: 6px;
+  }
+
+  .job-detail {
+    width: min(220px, 100%);
+    min-height: 0;
+    border: 0;
+    padding: 0;
+    display: grid;
+    gap: 5px;
+    background: transparent;
+    color: var(--muted);
+    text-align: left;
+  }
+
+  .status-cell small {
+    max-width: 180px;
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .job-progress {
+    position: relative;
+    width: 96px;
+    height: 3px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--surface-active);
+  }
+
+  .job-progress span {
+    position: absolute;
+    inset: -1px auto -1px -36px;
+    width: 36px;
+    border-radius: inherit;
+    background: var(--text);
+    animation: progress-slide 1.1s linear infinite;
+  }
+
+  .job-error,
+  .job-error small {
+    color: var(--danger);
+  }
+
+  .job-summary {
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 10px 12px;
+    display: grid;
+    gap: 6px;
+    font-size: 12px;
+  }
+
+  .job-summary span {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  .job-summary p {
+    color: var(--danger);
+    overflow-wrap: anywhere;
+  }
+
+  @keyframes progress-slide {
+    to {
+      transform: translateX(132px);
+    }
+  }
 
   .pager {
     min-height: 54px;
@@ -856,6 +1236,94 @@
 
   .pager select {
     width: 86px;
+  }
+
+  .provider-status {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: stretch;
+    gap: 18px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    margin-bottom: 18px;
+    padding: 16px;
+    background: var(--surface);
+  }
+
+  .provider-status span,
+  .provider-status dt {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  .provider-status strong {
+    display: block;
+    margin-top: 6px;
+    font-size: 18px;
+  }
+
+  .provider-status p {
+    margin-top: 8px;
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  .provider-select {
+    margin-top: 18px;
+    max-width: 420px;
+  }
+
+  .provider-select select {
+    min-height: 44px;
+    font-weight: 800;
+  }
+
+  .provider-status dl {
+    min-width: min(520px, 40vw);
+    margin: 0;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .provider-status dl div {
+    min-width: 0;
+    padding: 10px 12px;
+    border-right: 1px solid var(--line);
+  }
+
+  .provider-status dl div:last-child {
+    border-right: 0;
+  }
+
+  .provider-status dd {
+    margin: 6px 0 0;
+    overflow: hidden;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .provider-status.ready {
+    border-color: #1f9d4e;
+  }
+
+  .provider-status.ready strong {
+    color: #1f9d4e;
+  }
+
+  .provider-status.warn,
+  .provider-status.error {
+    border-color: var(--line);
+  }
+
+  .provider-status.warn strong,
+  .provider-status.error strong {
+    color: var(--danger);
   }
 
   .settings-grid {
@@ -874,7 +1342,7 @@
     border: 0;
     border-radius: 0;
     padding: 0;
-    background: rgba(0, 0, 0, 0.72);
+    background: var(--modal-backdrop);
   }
 
   .modal-wrap {
@@ -895,8 +1363,82 @@
   }
 
   .modal a {
-    color: #d7d7d7;
+    color: var(--text);
     overflow-wrap: anywhere;
+  }
+
+  .review-evidence {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .review-evidence div {
+    min-width: 0;
+    padding: 12px;
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    display: grid;
+    gap: 6px;
+  }
+
+  .review-evidence div:nth-child(2n) {
+    border-right: 0;
+  }
+
+  .review-evidence div:nth-last-child(-n + 2) {
+    border-bottom: 0;
+  }
+
+  .review-evidence span {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  .review-evidence strong {
+    min-width: 0;
+    overflow: hidden;
+    font-size: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .review-evidence .selected-ok strong {
+    color: #1f9d4e;
+  }
+
+  .provider-details {
+    display: grid;
+    gap: 10px;
+    justify-items: start;
+  }
+
+  .provider-details pre {
+    width: 100%;
+    max-height: 260px;
+    margin: 0;
+    overflow: auto;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--text);
+    padding: 12px;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .recheck-notice {
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 10px 12px;
+    color: var(--muted);
+    font-size: 12px;
   }
 
   .actions {
@@ -907,10 +1449,11 @@
 
   .toast-stack {
     position: fixed;
-    right: 24px;
     bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
     z-index: 10;
-    width: min(380px, calc(100vw - 32px));
+    width: min(420px, calc(100vw - 32px));
     display: grid;
     gap: 10px;
   }
@@ -918,26 +1461,26 @@
   .toast {
     min-height: 44px;
     width: 100%;
-    border-color: #555;
-    background: #101010;
-    color: #f4f4f4;
+    border-color: var(--line);
+    background: var(--surface);
+    color: var(--text);
     padding: 11px 14px;
-    text-align: left;
-    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+    text-align: center;
+    box-shadow: 0 12px 28px var(--toast-shadow);
   }
 
   .toast.success {
-    border-color: #2b8a4b;
-    color: #8bf0a5;
+    border-color: var(--line);
+    color: var(--text);
   }
 
   .toast.error {
-    border-color: #a33;
-    color: #ff9b9b;
+    border-color: var(--line);
+    color: var(--text);
   }
 
   .error, .empty {
-    color: #ff8585;
+    color: var(--danger);
   }
 
   @media (max-width: 760px) {
@@ -990,8 +1533,39 @@
       grid-template-columns: 1fr;
     }
 
+    .provider-status {
+      grid-template-columns: 1fr;
+    }
+
+    .provider-status dl {
+      min-width: 0;
+      grid-template-columns: 1fr;
+    }
+
+    .provider-status dl div {
+      border-right: 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .provider-status dl div:last-child {
+      border-bottom: 0;
+    }
+
+    .review-evidence {
+      grid-template-columns: 1fr;
+    }
+
+    .review-evidence div,
+    .review-evidence div:nth-child(2n) {
+      border-right: 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .review-evidence div:last-child {
+      border-bottom: 0;
+    }
+
     .toast-stack {
-      right: 16px;
       bottom: 16px;
       width: calc(100vw - 32px);
     }

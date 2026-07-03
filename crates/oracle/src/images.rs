@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use anyhow::{bail, Result};
 use url::Url;
 
-pub fn normalize_image_url(raw: &str) -> Result<String> {
+pub fn normalize_media_url(raw: &str) -> Result<String> {
     let mut url = Url::parse(raw)?;
     match url.scheme() {
         "https" | "http" => {}
@@ -24,6 +24,14 @@ pub fn normalize_image_url(raw: &str) -> Result<String> {
 
     url.set_fragment(None);
     Ok(url.to_string())
+}
+
+pub fn normalize_image_url(raw: &str) -> Result<String> {
+    normalize_media_url(raw)
+}
+
+pub fn normalize_video_url(raw: &str) -> Result<String> {
+    normalize_media_url(raw)
 }
 
 pub fn is_blocked_hostname(host: &str) -> bool {
@@ -56,16 +64,24 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
 }
 
 pub fn extract_image_urls(content: &str) -> Vec<String> {
+    extract_urls_with_extensions(content, &[".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"])
+}
+
+pub fn extract_video_urls(content: &str) -> Vec<String> {
+    extract_urls_with_extensions(content, &[".mp4", ".webm", ".mov", ".m4v"])
+}
+
+fn extract_urls_with_extensions(content: &str, extensions: &[&str]) -> Vec<String> {
     content
         .split_whitespace()
         .filter_map(|part| {
             let trimmed = part.trim_matches(|ch: char| matches!(ch, '"' | '\'' | ')' | '(' | '[' | ']' | '<' | '>' | ','));
             let lower = trimmed.to_ascii_lowercase();
-            let looks_like_image = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"]
+            let looks_like_media = extensions
                 .iter()
                 .any(|suffix| lower.split('?').next().unwrap_or_default().ends_with(suffix));
-            if looks_like_image {
-                normalize_image_url(trimmed).ok()
+            if looks_like_media {
+                normalize_media_url(trimmed).ok()
             } else {
                 None
             }
@@ -90,5 +106,11 @@ mod tests {
     fn normalizes_public_image_url() {
         let normalized = normalize_image_url("https://example.com/a.png#frag").unwrap();
         assert_eq!(normalized, "https://example.com/a.png");
+    }
+
+    #[test]
+    fn extracts_video_urls() {
+        let urls = extract_video_urls("watch https://example.com/a.mp4?x=1 and https://example.com/b.webm");
+        assert_eq!(urls, vec!["https://example.com/a.mp4?x=1", "https://example.com/b.webm"]);
     }
 }

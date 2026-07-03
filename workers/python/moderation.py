@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 from PIL import Image
 
@@ -14,6 +14,7 @@ class Verdict:
     source: str = "local_model"
     model_version: str = "deterministic-v0"
     explanation: str | None = None
+    provider_response: dict[str, Any] | None = None
 
     @property
     def safe(self) -> bool:
@@ -38,6 +39,7 @@ def csam_suspected_verdict(
     source: str,
     model_version: str,
     explanation: str | None = None,
+    provider_response: dict[str, Any] | None = None,
 ) -> Verdict:
     return Verdict(
         status="block",
@@ -46,6 +48,7 @@ def csam_suspected_verdict(
         source=source,
         model_version=model_version,
         explanation=explanation or "emergency moderation label requiring operator process",
+        provider_response=provider_response,
     )
 
 

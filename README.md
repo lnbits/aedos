@@ -1,31 +1,40 @@
-<h1 style="font-size:5em !important"> <img width="60px" src="https://github.com/user-attachments/assets/259e50cb-fd73-4218-8a29-360293828186"> Aedos</h1>
+<h1 style="font-size:5em !important"><img width="60px" src="images/logo.png"> Aedos</h1>
 
-`Aedos` is an AI-powered moderation oracle for Nostr. It checks images and events, caches the result, and publishes signed moderation labels that clients and relays can choose to trust.
+`Aedos` is an AI-powered moderation oracle for Nostr. It reviews notes, images, and videos, caches verdicts, and produces Nostr-native moderation labels that clients and relays can choose to trust.
 
-Nostr gives users and relays a lot of freedom, but that also means every client or relay is left to solve abuse, spam, NSFW media, graphic content, and illegal material on its own. Aedos turns moderation into portable infrastructure: one service can review media once, store the verdict by event ID and image hash, and make that signal reusable across the network.
+Nostr gives users, clients, and relays freedom, but it also means every app is left to solve abuse, spam, NSFW media, graphic content, and illegal material on its own. Aedos turns that work into reusable infrastructure: review content once, store a lean verdict by event ID and media hash, and make the result available through HTTP, WebSockets, and Nostr label events.
 
-## What Is Included
+## What Aedos Does
 
-- Rust oracle service with HTTP and WebSocket APIs.
-- Postgres schema for events, images, verdicts, reports, and published labels.
-- Redis-backed analysis queue.
-- Python worker with image download, SHA-256, perceptual hash, and a swappable moderation model interface.
-- Swappable moderation providers. The default deterministic provider is for development; `MODERATION_PROVIDER=openai` enables OpenAI image moderation.
-- NIP-32 label draft generation using kind `1985`, `L` namespace tags, matching `l` label marks, and target tags.
-- Realtime verdict event draft generation with configurable `ORACLE_VERDICT_KIND` defaulting to `31494`.
-- Emergency escalation records for `csam-suspected` verdicts. These store audit metadata such as event ID, URL, hashes, confidence, source, and status; they do not store image bytes.
-- SSRF guardrails for localhost, loopback, private, and link-local URL targets.
-- Docker Compose for Postgres, Redis, Rust oracle, Python worker, and SvelteKit admin dashboard.
+- Checks Nostr events, text tags, image URLs, and direct video URLs.
+- Caches by event ID first, then by image/video SHA-256, so known media is not sent to the AI provider again.
+- Uses a swappable moderation provider interface.
+- Ships with a deterministic local provider for development.
+- Supports OpenAI image moderation with `MODERATION_PROVIDER=openai`.
+- Samples video frames with `ffmpeg` and reviews those frames through the configured image moderation provider.
+- Detects high-risk text tags such as `#csam`, `#pedo`, and `#loli`, plus NSFW tags such as `#nsfw`, `#porn`, and `#nudity`.
+- Stores author/pubkey links so Aedos can expose NSFW and CSAM-suspected author lists.
+- Stores compact provider response details for audit/debugging, not full media bytes.
+- Provides a SvelteKit admin dashboard with login, stats, media review, recheck actions, settings, theme toggle, relay status, and job error visibility.
+- Generates NIP-32 label drafts using kind `1985`.
+
+## Current Limits
+
+- Relay publishing is isolated in `crates/oracle/src/nostr.rs`; the code validates NIP-shaped label drafts, but the live relay publisher is not the strongest part of the system yet.
+- Video review checks sampled visual frames only. It does not inspect audio, subtitles, or HLS playlists.
+- The text review layer is rule-based and focused on explicit Nostr tags/hashtags.
+- OpenAI OAuth is not used. Aedos currently expects an API key.
+- `csam-suspected` records are moderation signals for operator/legal process. Aedos does not store image or video bytes for these escalations.
 
 ## Quick Start
 
-1. Copy the example environment file:
+Copy the example environment file:
 
 ```bash
 cp .env.example .env
 ```
 
-2. Start the full stack:
+Start the stack:
 
 ```bash
 docker compose up --build
@@ -39,58 +48,80 @@ This starts:
 - Python moderation worker
 - SvelteKit admin dashboard
 
-3. Open the dashboard:
+Open the dashboard:
 
 ```text
 http://localhost:3000
 ```
 
-On first load, create the first admin username and password. After setup, the dashboard uses an HttpOnly session cookie for login.
+On first load, create the first admin account. The dashboard stores the password with Argon2 and uses an HttpOnly, SameSite session cookie.
 
-4. Check the oracle API:
+Check the API:
 
 ```bash
 curl http://localhost:8080/health
 ```
 
-5. Submit a test image event:
-
-```bash
-curl -X POST http://localhost:8080/v1/check \
-  -H 'content-type: application/json' \
-  -d '{"event_id":"example","image_urls":["https://example.com/image.png"]}'
-```
-
-The first response may be `unknown` while the worker downloads, hashes, and reviews the image. Later calls for the same event ID return the cached event verdict. New events with an already-seen image SHA-256 reuse the cached image verdict and do not call the AI provider again.
-
-Useful local URLs:
-
-- Dashboard: `http://localhost:3000`
-- Oracle API: `http://localhost:8080`
-- Health: `http://localhost:8080/health`
-- Metrics: `http://localhost:8080/metrics`
-
-To run in the background:
-
-```bash
-docker compose up --build -d
-```
-
-To stop:
+Stop the stack:
 
 ```bash
 docker compose down
 ```
 
-By default, Aedos uses the deterministic development provider, which marks valid images as safe and does not call any external AI service.
+## Submit Content
 
-## OpenAI Image Moderation
+`POST /v1/check` accepts an event ID plus optional author, image URLs, and video URLs.
 
-OpenAI image moderation is the easiest production reviewer to enable first. The worker sends OpenAI only new image hashes that are not already cached by Aedos.
+```bash
+curl -X POST http://localhost:8080/v1/check \
+  -H 'content-type: application/json' \
+  -d '{
+    "event_id": "example-event",
+    "npub": "npub1...",
+    "image_urls": ["https://example.com/image.png"],
+    "video_urls": ["https://example.com/video.mp4"]
+  }'
+```
 
-1. Create an OpenAI API key.
+`event_id` is required. `npub`/`pubkey`, `image_urls`, and `video_urls` are optional.
 
-2. Either edit `.env` before startup:
+The first response may be `unknown` while the worker downloads and reviews the media:
+
+```json
+{
+  "type": "verdict",
+  "event_id": "example-event",
+  "status": "unknown",
+  "cache": false,
+  "labels": ["unknown"],
+  "confidence": 0.0
+}
+```
+
+Later calls for the same event ID return the cached event verdict. New events with an already-seen image or video SHA-256 reuse the cached media verdict and do not call the AI provider again.
+
+`POST /v1/submit` accepts a raw Nostr event. Aedos stores the event, extracts image/video URLs from the content, records the author, and checks text tags.
+
+```bash
+curl -X POST http://localhost:8080/v1/submit \
+  -H 'content-type: application/json' \
+  -d '{
+    "raw_event": {
+      "id": "...",
+      "pubkey": "...",
+      "kind": 1,
+      "content": "hello #nsfw",
+      "tags": [["t", "nsfw"]],
+      "created_at": 1710000000
+    }
+  }'
+```
+
+## OpenAI Moderation
+
+By default, Aedos uses the deterministic development provider. It does not call any external AI service.
+
+To enable OpenAI:
 
 ```env
 MODERATION_PROVIDER=openai
@@ -98,106 +129,239 @@ OPENAI_API_KEY=sk-...
 OPENAI_MODERATION_MODEL=omni-moderation-latest
 ```
 
-Or start Aedos with the deterministic provider, open the dashboard, and update these settings there. Dashboard settings are stored in Postgres and are hot-applied by the worker on its next queue loop. Aedos will reject `MODERATION_PROVIDER=openai` unless an `OPENAI_API_KEY` is also set.
+You can set those in `.env` before startup or in the dashboard settings page after setup. Dashboard settings are stored in Postgres and the Python worker hot-applies provider settings on its next queue loop.
 
-3. Start or restart Aedos:
+Aedos refuses `MODERATION_PROVIDER=openai` unless `OPENAI_API_KEY` is present.
 
-```bash
-docker compose up --build
+OpenAI responses are stored in a compact audit shape:
+
+- response ID
+- model
+- `flagged`
+- categories
+- category scores
+- category input-type map
+
+The full image or video is not stored in the database. For videos, Aedos stores the video hash and metadata, then sends sampled frames for review.
+
+## Verdict Labels
+
+Supported labels currently include:
+
+```text
+safe
+nsfw
+nudity
+sexual
+sexualised
+graphic
+gore
+violence
+weapon
+self-harm
+hate-symbol
+spam
+scam
+csam-suspected
+unknown
 ```
 
-4. Check health:
+OpenAI category mapping includes:
 
-```bash
-curl http://localhost:8080/health
+- `sexual/minors` -> `csam-suspected`
+- `sexual` -> `nsfw`, `sexual`
+- high sexual score without a category flag -> `sexualised`
+- `violence` -> `violence`
+- `violence/graphic` -> `graphic`, `gore`
+- self-harm categories -> `self-harm`
+- hate categories -> `hate-symbol`
+- illicit categories -> `scam`
+
+`csam-suspected` is treated as a block verdict and creates an emergency escalation metadata row. Operators still need a real legal/process path before using that signal in production.
+
+## Nostr Label Events
+
+The interoperable Nostr verdict format is NIP-32 Labeling.
+
+Aedos builds label event drafts like this:
+
+```json
+{
+  "kind": 1985,
+  "tags": [
+    ["L", "nostr.com/moderation"],
+    ["l", "nsfw", "nostr.com/moderation"],
+    ["l", "sexual", "nostr.com/moderation"],
+    ["e", "<event-id>"]
+  ],
+  "content": "{\"status\":\"warn\",\"confidence\":0.85,\"source\":\"openai_moderation\",\"explanation\":\"OpenAI moderation flagged image categories\"}"
+}
 ```
 
-5. Submit an image check:
+Target tags:
 
-```bash
-curl -X POST http://localhost:8080/v1/check \
-  -H 'content-type: application/json' \
-  -d '{"event_id":"example","image_urls":["https://example.com/image.png"]}'
-```
+- `["e", "<event-id>"]` for event verdicts
+- `["p", "<hex-pubkey>"]` for author/pubkey verdicts
+- `["r", "<url>"]` for URL verdicts
+- `["x", "<sha256>"]` for image and video hash verdicts
 
-The first response may be `unknown` while the worker downloads, hashes, and reviews the image. Later calls for the same event ID return the cached event verdict. New events with an already-seen image SHA-256 reuse the cached image verdict and do not call OpenAI again.
-
-## Queue Reliability
-
-Analysis jobs are stored in a Redis Stream with a worker consumer group. Workers acknowledge a job only after it has been processed successfully. Failed jobs are retried with exponential backoff and then moved to a dead-letter stream after the retry limit is reached. Active and dead-letter streams are capped with Redis `MAXLEN` so a busy relay can run continuously without unbounded queue growth.
-
-Queue keys:
-
-- `oracle:analysis`: active analysis stream
-- `oracle:analysis:retry`: delayed retry set
-- `oracle:analysis:dead`: dead-letter stream
-
-This gives Aedos safe restart behavior for normal worker crashes and provider failures without dropping jobs silently.
+There is also a configurable realtime event draft kind, `ORACLE_VERDICT_KIND`, defaulting to `31494`. That is Aedos-specific and useful for direct integrations, but NIP-32 kind `1985` is the standards-aligned format clients and relays should prefer.
 
 ## Dashboard
 
-The SvelteKit dashboard lives in `apps/dashboard` and is included in Docker Compose.
+The dashboard runs at:
 
-It provides:
+```text
+http://localhost:3000
+```
 
-- Overview stats for processed images, daily processing, queue depth, retries, and dead letters.
-- A searchable, paginated image table with event ID search.
-- Operator review controls for changing an image verdict.
-- A settings page for allowlisted operational values such as moderation limits, queue retention, rate limits, Nostr relay config, and provider settings.
+It includes:
 
-Settings are stored in Postgres and secret values are masked when read back. Worker/provider settings are hot-applied by the Python worker on its next queue loop; public API rate limits and queue retention are also read from the stored settings. The dashboard is intentionally not a raw remote `.env` file editor.
+- First-install admin setup.
+- Login/logout using server-side sessions.
+- Overview stats for processed media, daily volume, queue depth, retries, dead letters, and status counts.
+- Nostr relay connectivity checks with online/offline indicators.
+- Searchable, paginated image/video table.
+- Processing/retry/failed job status.
+- Job error details when a fetch or provider call fails.
+- Review modal for changing verdicts.
+- `Recheck with AI` action for forcing a fresh provider review.
+- Provider response details for OpenAI audit data.
+- Settings page with masked secrets and explanatory hints.
+- Light/dark theme toggle stored in localStorage.
 
-Hot-applied settings include:
+Settings are stored in Postgres. Secret settings are masked when read back.
+
+Hot-applied worker/provider settings:
 
 - `MODERATION_PROVIDER`
 - `OPENAI_API_KEY`
 - `OPENAI_MODERATION_MODEL`
 - `MAX_IMAGE_BYTES`
+- `MAX_VIDEO_BYTES`
 - `IMAGE_FETCH_TIMEOUT_SECONDS`
+- `MAX_VIDEO_FRAMES`
+- `VIDEO_FRAME_INTERVAL_SECONDS`
 - `QUEUE_STREAM_MAXLEN`
 - `QUEUE_DEAD_LETTER_MAXLEN`
+
+Public API rate limiting is controlled by:
+
 - `RATE_LIMIT_CHECKS_PER_MINUTE`
 
-Some boot-level settings still require restarting the relevant service after editing `.env`, such as database URLs, Redis URLs, bind ports, and Compose port mappings.
+Boot-level settings still require restarting the relevant service after editing `.env`, such as database URLs, Redis URLs, bind ports, and Compose port mappings.
+
+## Author Lists
+
+Aedos can return authors whose stored event verdicts include NSFW or CSAM-suspected labels.
+
+```text
+GET /v1/npubs/nsfw
+GET /v1/npubs/csam
+```
+
+Responses include hex pubkeys, bech32 `npub` values when valid, event counts, recent event IDs, and the latest matching time.
+
+These lists are derived from stored verdicts and event/pubkey links. They are not external blocklists.
+
+## Queue Reliability
+
+Analysis jobs are stored in Redis:
+
+- `oracle:analysis`: active analysis stream
+- `oracle:analysis:retry`: delayed retry set
+- `oracle:analysis:dead`: dead-letter stream
+
+Workers acknowledge jobs only after successful processing. Failed jobs are retried with exponential backoff and then moved to the dead-letter stream after the retry limit is reached. Stream sizes are capped with Redis `MAXLEN` settings so busy deployments do not grow without bounds.
+
+The dashboard also stores per-media job state in Postgres so operators can see whether a media item is queued, processing, retrying, completed, or failed.
+
+## Data Storage
+
+Aedos stores:
+
+- Event IDs, optional pubkeys, content, and raw event JSON for submitted events.
+- Image/video URLs, normalized URLs, SHA-256 hashes, metadata, and image perceptual hashes.
+- Event-to-media links.
+- Verdicts with status, labels, confidence, source, model version, explanation, and compact provider response.
+- Emergency escalation metadata for `csam-suspected`.
+- Dashboard users, sessions, settings, and rate-limit counters.
+
+Aedos does not store image or video bytes in Postgres.
 
 ## API
+
+Public API:
 
 - `POST /v1/check`
 - `POST /v1/check_batch`
 - `POST /v1/submit`
 - `GET /v1/event/:event_id`
 - `GET /v1/image/:sha256`
+- `GET /v1/video/:sha256`
+- `GET /v1/npubs/nsfw`
+- `GET /v1/npubs/csam`
 - `GET /v1/ws`
 - `GET /health`
 - `GET /metrics`
 
-WebSocket messages:
+Dashboard API:
+
+- `GET/POST /admin/api/setup`
+- `POST /admin/api/login`
+- `POST /admin/api/logout`
+- `GET /admin/api/session`
+- `GET /admin/api/overview`
+- `GET /admin/api/images`
+- `POST /admin/api/images/:sha256/verdict`
+- `POST /admin/api/images/:sha256/recheck`
+- `POST /admin/api/videos/:sha256/verdict`
+- `POST /admin/api/videos/:sha256/recheck`
+- `GET/POST /admin/api/settings`
+
+WebSocket check:
 
 ```json
-{"type":"check","event_id":"...","image_urls":["https://example.com/a.png"]}
+{"type":"check","event_id":"...","npub":"npub1...","image_urls":["https://example.com/a.png"],"video_urls":["https://example.com/a.mp4"]}
 ```
+
+WebSocket batch check:
 
 ```json
-{"type":"check_batch","events":[{"event_id":"...","image_urls":[]}]}
+{"type":"check_batch","events":[{"event_id":"...","npub":"npub1...","image_urls":[],"video_urls":[]}]}
 ```
 
-## Nostr Compliance Notes
+## Environment
 
-The implementation references the local `nips/` folder:
+See `.env.example` for defaults. Important values:
 
-- NIP-01 event/tag conventions.
-- NIP-32 labeling: kind `1985`, `L` namespace tag, `l` labels with matching namespace mark, and `e`/`p`/`r`/`x` targets.
-- NIP-56 report schema is represented in the database for report ingestion.
+- `DATABASE_URL`
+- `REDIS_URL`
+- `NOSTR_PRIVATE_KEY`
+- `NOSTR_RELAYS`
+- `LABEL_NAMESPACE`
+- `ORACLE_VERDICT_KIND`
+- `MAX_IMAGE_BYTES`
+- `MAX_VIDEO_BYTES`
+- `IMAGE_FETCH_TIMEOUT_SECONDS`
+- `MAX_VIDEO_FRAMES`
+- `VIDEO_FRAME_INTERVAL_SECONDS`
+- `WORKER_CONCURRENCY`
+- `QUEUE_CONSUMER_GROUP`
+- `QUEUE_CONSUMER_NAME`
+- `QUEUE_STREAM_MAXLEN`
+- `QUEUE_DEAD_LETTER_MAXLEN`
+- `RATE_LIMIT_CHECKS_PER_MINUTE`
+- `MODERATION_PROVIDER`
+- `OPENAI_API_KEY`
+- `OPENAI_MODERATION_MODEL`
+- `API_KEYS`
 
-The production relay publisher is isolated in `crates/oracle/src/nostr.rs`; current tests validate the NIP-shaped event drafts without needing external relays or private keys.
+`NOSTR_PRIVATE_KEY` is for signing moderation label events so clients and relays can verify that labels came from your Aedos instance.
 
-## Emergency Moderation Notes
+`NOSTR_RELAYS` are the relays Aedos is configured to use for Nostr label delivery. The dashboard currently uses them to show WebSocket connectivity while the relay publisher remains isolated in the Nostr module.
 
-`csam-suspected` is treated as a high-severity block label, not as an ordinary moderation category. When a worker model emits that label, the worker stores the normal verdict and adds an `emergency_escalations` row with metadata for an operator-controlled process.
-
-This project intentionally avoids storing image bytes for escalations. Operators should define access controls, retention, reporting obligations, and review procedures for their jurisdiction before enabling any production model that can emit emergency labels.
-
-## Test
+## Tests
 
 Rust:
 
@@ -212,23 +376,10 @@ cd workers/python
 uv run pytest
 ```
 
-## Environment
+Dashboard:
 
-See `.env.example` for all settings. Important values:
-
-- `DATABASE_URL`
-- `REDIS_URL`
-- `NOSTR_PRIVATE_KEY`
-- `NOSTR_RELAYS`
-- `LABEL_NAMESPACE`
-- `ORACLE_VERDICT_KIND`
-- `MAX_IMAGE_BYTES`
-- `IMAGE_FETCH_TIMEOUT_SECONDS`
-- `QUEUE_CONSUMER_GROUP`
-- `QUEUE_CONSUMER_NAME`
-- `QUEUE_STREAM_MAXLEN`
-- `QUEUE_DEAD_LETTER_MAXLEN`
-- `RATE_LIMIT_CHECKS_PER_MINUTE`
-- `MODERATION_PROVIDER`
-- `OPENAI_API_KEY`
-- `OPENAI_MODERATION_MODEL`
+```bash
+cd apps/dashboard
+npm install
+npm run check
+```

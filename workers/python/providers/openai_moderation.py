@@ -10,6 +10,13 @@ from moderation import Verdict, csam_suspected_verdict
 
 
 OPENAI_MODERATIONS_URL = "https://api.openai.com/v1/moderations"
+SEXUALISED_SCORE_THRESHOLD = 0.30
+
+
+class OpenAIProviderError(RuntimeError):
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class OpenAIModerationModel:
@@ -46,12 +53,12 @@ class OpenAIModerationModel:
         }
         if self._client is not None:
             response = await self._client.post(OPENAI_MODERATIONS_URL, headers=headers, json=body)
-            response.raise_for_status()
+            raise_for_openai_status(response)
             return response.json()
 
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(OPENAI_MODERATIONS_URL, headers=headers, json=body)
-            response.raise_for_status()
+            raise_for_openai_status(response)
             return response.json()
 
 
@@ -61,12 +68,40 @@ def image_data_url(payload: bytes, mime_type: str) -> str:
     return f"data:{safe_mime_type};base64,{encoded}"
 
 
+def raise_for_openai_status(response: httpx.Response) -> None:
+    if response.is_success:
+        return
+    retry_after = response.headers.get("retry-after")
+    message = ""
+    try:
+        body = response.json()
+    except ValueError:
+        body = response.text
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            message = str(error.get("message") or error.get("code") or error.get("type") or "")
+        else:
+            message = str(body)
+    else:
+        message = body
+    details = f"OpenAI moderation returned HTTP {response.status_code}"
+    if message:
+        details = f"{details}: {message}"
+    if retry_after:
+        details = f"{details} Retry after {retry_after} seconds."
+    retryable = response.status_code >= 500 or (response.status_code == 429 and retry_after is not None)
+    raise OpenAIProviderError(details, retryable=retryable)
+
+
 def verdict_from_openai_response(response: dict[str, Any], model_version: str) -> Verdict:
     result = response.get("results", [{}])[0]
     categories = result.get("categories", {})
     scores = result.get("category_scores", {})
+    provider_response = openai_provider_response(response)
     labels = labels_from_categories(categories)
     confidence = max((float(scores.get(category, 0.0)) for category in categories), default=0.0)
+    sexual_score = float(scores.get("sexual", 0.0))
 
     if "csam-suspected" in labels:
         return csam_suspected_verdict(
@@ -74,6 +109,7 @@ def verdict_from_openai_response(response: dict[str, Any], model_version: str) -
             source="openai_moderation",
             model_version=model_version,
             explanation="OpenAI moderation returned sexual/minors",
+            provider_response=provider_response,
         )
 
     if labels:
@@ -85,6 +121,18 @@ def verdict_from_openai_response(response: dict[str, Any], model_version: str) -
             source="openai_moderation",
             model_version=model_version,
             explanation="OpenAI moderation flagged image categories",
+            provider_response=provider_response,
+        )
+
+    if sexual_score >= SEXUALISED_SCORE_THRESHOLD:
+        return Verdict(
+            status="warn",
+            labels=["sexualised"],
+            confidence=sexual_score,
+            source="openai_moderation",
+            model_version=model_version,
+            explanation=f"OpenAI sexual score {sexual_score:.3f} met sexualised threshold {SEXUALISED_SCORE_THRESHOLD:.2f}",
+            provider_response=provider_response,
         )
 
     return Verdict(
@@ -94,7 +142,20 @@ def verdict_from_openai_response(response: dict[str, Any], model_version: str) -
         source="openai_moderation",
         model_version=model_version,
         explanation="OpenAI moderation did not flag image categories",
+        provider_response=provider_response,
     )
+
+
+def openai_provider_response(response: dict[str, Any]) -> dict[str, Any]:
+    result = response.get("results", [{}])[0]
+    return {
+        "id": response.get("id"),
+        "model": response.get("model"),
+        "flagged": result.get("flagged"),
+        "categories": result.get("categories", {}),
+        "category_scores": result.get("category_scores", {}),
+        "category_applied_input_types": result.get("category_applied_input_types", {}),
+    }
 
 
 def labels_from_categories(categories: dict[str, Any]) -> list[str]:

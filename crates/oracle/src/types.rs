@@ -7,6 +7,7 @@ pub const SUPPORTED_LABELS: &[&str] = &[
     "nsfw",
     "nudity",
     "sexual",
+    "sexualised",
     "graphic",
     "gore",
     "violence",
@@ -24,6 +25,7 @@ pub const SUPPORTED_LABELS: &[&str] = &[
 pub enum TargetType {
     Event,
     Image,
+    Video,
     Url,
     Pubkey,
 }
@@ -33,6 +35,7 @@ impl TargetType {
         match self {
             Self::Event => "event",
             Self::Image => "image",
+            Self::Video => "video",
             Self::Url => "url",
             Self::Pubkey => "pubkey",
         }
@@ -141,15 +144,23 @@ impl Verdict {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckRequest {
     pub event_id: String,
+    #[serde(default, alias = "npub")]
+    pub pubkey: Option<String>,
     #[serde(default)]
     pub image_urls: Vec<String>,
+    #[serde(default)]
+    pub video_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitRequest {
     pub event_id: Option<String>,
+    #[serde(default, alias = "npub")]
+    pub pubkey: Option<String>,
     #[serde(default)]
     pub image_urls: Vec<String>,
+    #[serde(default)]
+    pub video_urls: Vec<String>,
     #[serde(default)]
     pub raw_event: Option<Value>,
 }
@@ -157,8 +168,12 @@ pub struct SubmitRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchEvent {
     pub event_id: String,
+    #[serde(default, alias = "npub")]
+    pub pubkey: Option<String>,
     #[serde(default)]
     pub image_urls: Vec<String>,
+    #[serde(default)]
+    pub video_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

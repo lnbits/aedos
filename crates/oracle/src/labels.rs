@@ -46,7 +46,7 @@ pub fn build_nip32_label(
         TargetType::Event => tags.push(vec!["e".to_string(), target_id.to_string()]),
         TargetType::Pubkey => tags.push(vec!["p".to_string(), target_id.to_string()]),
         TargetType::Url => tags.push(vec!["r".to_string(), target_id.to_string()]),
-        TargetType::Image => tags.push(vec!["x".to_string(), target_id.to_string()]),
+        TargetType::Image | TargetType::Video => tags.push(vec!["x".to_string(), target_id.to_string()]),
     }
 
     EventDraft {

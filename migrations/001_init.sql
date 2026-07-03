@@ -9,6 +9,8 @@ create table if not exists events (
   verdict_status text not null default 'unknown'
 );
 
+create index if not exists events_pubkey_idx on events (pubkey);
+
 create table if not exists images (
   id uuid primary key,
   url text not null,
@@ -31,6 +33,24 @@ create table if not exists event_images (
   primary key (event_id, image_id)
 );
 
+create table if not exists videos (
+  id uuid primary key,
+  url text not null,
+  normalized_url text not null,
+  sha256 text unique,
+  mime_type text,
+  bytes integer,
+  first_seen_at timestamptz not null default now()
+);
+
+create index if not exists videos_normalized_url_idx on videos (normalized_url);
+
+create table if not exists event_videos (
+  event_id text not null references events(id) on delete cascade,
+  video_id uuid not null references videos(id) on delete cascade,
+  primary key (event_id, video_id)
+);
+
 create table if not exists verdicts (
   id uuid primary key,
   target_type text not null,
@@ -47,6 +67,7 @@ create table if not exists verdicts (
   cache boolean not null default false,
   model_version text,
   explanation text,
+  provider_response jsonb,
   created_at timestamptz not null default now()
 );
 

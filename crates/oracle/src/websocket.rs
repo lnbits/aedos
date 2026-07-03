@@ -21,8 +21,12 @@ enum ClientMessage {
     #[serde(rename = "check")]
     Check {
         event_id: String,
+        #[serde(default, alias = "npub")]
+        pubkey: Option<String>,
         #[serde(default)]
         image_urls: Vec<String>,
+        #[serde(default)]
+        video_urls: Vec<String>,
     },
     #[serde(rename = "check_batch")]
     CheckBatch { events: Vec<BatchEvent> },
@@ -41,9 +45,18 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
             continue;
         };
         let responses = match serde_json::from_str::<ClientMessage>(&text) {
-            Ok(ClientMessage::Check { event_id, image_urls }) => {
-                let req = CheckRequest { event_id, image_urls };
-                respond_to_events(&state, vec![BatchEvent { event_id: req.event_id, image_urls: req.image_urls }]).await
+            Ok(ClientMessage::Check { event_id, pubkey, image_urls, video_urls }) => {
+                let req = CheckRequest { event_id, pubkey, image_urls, video_urls };
+                respond_to_events(
+                    &state,
+                    vec![BatchEvent {
+                        event_id: req.event_id,
+                        pubkey: req.pubkey,
+                        image_urls: req.image_urls,
+                        video_urls: req.video_urls,
+                    }],
+                )
+                .await
             }
             Ok(ClientMessage::CheckBatch { events }) => respond_to_events(&state, events).await,
             Err(err) => vec![serde_json::json!({ "type": "error", "error": err.to_string() })],

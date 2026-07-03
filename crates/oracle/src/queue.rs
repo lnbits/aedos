@@ -9,14 +9,29 @@ pub const DEFAULT_STREAM_MAXLEN: usize = 1_000_000;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AnalysisJob {
     pub event_id: String,
+    #[serde(default)]
+    pub pubkey: Option<String>,
     pub image_urls: Vec<String>,
+    #[serde(default)]
+    pub video_urls: Vec<String>,
+    #[serde(default)]
+    pub image_sha256: Option<String>,
+    #[serde(default)]
+    pub force_recheck: bool,
+    #[serde(default)]
+    pub image_only: bool,
 }
 
 impl From<BatchEvent> for AnalysisJob {
     fn from(value: BatchEvent) -> Self {
         Self {
             event_id: value.event_id,
+            pubkey: value.pubkey,
             image_urls: value.image_urls,
+            video_urls: value.video_urls,
+            image_sha256: None,
+            force_recheck: false,
+            image_only: false,
         }
     }
 }

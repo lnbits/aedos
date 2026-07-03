@@ -26,6 +26,7 @@ use tokio_tungstenite::connect_async;
 use uuid::Uuid;
 
 use crate::{api::AppState, db::status_str, types::{TargetType, Verdict, VerdictStatus}};
+use crate::queue::{AnalysisJob, DEFAULT_STREAM_MAXLEN};
 
 const SESSION_COOKIE: &str = "aedos_session";
 const SESSION_TTL_SECONDS: i64 = 60 * 60 * 24 * 7;
@@ -40,6 +41,9 @@ pub fn router() -> Router<AppState> {
         .route("/admin/api/overview", get(overview))
         .route("/admin/api/images", get(images))
         .route("/admin/api/images/:sha256/verdict", post(change_image_verdict))
+        .route("/admin/api/images/:sha256/recheck", post(recheck_image))
+        .route("/admin/api/videos/:sha256/verdict", post(change_video_verdict))
+        .route("/admin/api/videos/:sha256/recheck", post(recheck_video))
         .route("/admin/api/settings", get(settings).post(save_settings))
 }
 
@@ -95,7 +99,8 @@ struct RelayStatus {
 
 #[derive(Debug, Serialize)]
 struct ImageRow {
-    sha256: String,
+    media_type: String,
+    sha256: Option<String>,
     url: String,
     mime_type: Option<String>,
     width: Option<i32>,
@@ -108,7 +113,11 @@ struct ImageRow {
     source: Option<String>,
     model_version: Option<String>,
     explanation: Option<String>,
+    provider_response: Option<serde_json::Value>,
     verdict_created_at: Option<chrono::DateTime<chrono::Utc>>,
+    job_status: Option<String>,
+    job_error: Option<String>,
+    job_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     event_ids: Vec<String>,
 }
 
@@ -157,6 +166,10 @@ impl AdminError {
 
     fn forbidden(message: impl Into<String>) -> Self {
         Self { status: StatusCode::FORBIDDEN, message: message.into() }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self { status: StatusCode::NOT_FOUND, message: message.into() }
     }
 
     fn unavailable() -> Self {
@@ -301,6 +314,7 @@ async fn images(
     Query(query): Query<ImagesQuery>,
 ) -> Result<Json<ImagesResponse>, AdminError> {
     let pool = authed_pool(&state, &headers).await?;
+    ensure_admin_schema(pool).await?;
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(25).clamp(5, 100);
     let offset = (page - 1) * per_page;
@@ -309,10 +323,25 @@ async fn images(
 
     let total: i64 = sqlx::query_scalar(
         r#"
-        select count(distinct i.sha256)
-        from images i
-        left join event_images ei on ei.image_id = i.id
-        where $1 = '' or i.sha256 ilike $2 or i.url ilike $2 or ei.event_id ilike $2
+        with rows as (
+            select i.sha256 as row_id
+            from images i
+            left join event_images ei on ei.image_id = i.id
+            where $1 = '' or i.sha256 ilike $2 or i.url ilike $2 or ei.event_id ilike $2
+            group by i.sha256
+            union all
+            select v.sha256 as row_id
+            from videos v
+            left join event_videos ev on ev.video_id = v.id
+            where $1 = '' or v.sha256 ilike $2 or v.url ilike $2 or ev.event_id ilike $2
+            group by v.sha256
+            union all
+            select aj.job_key as row_id
+            from analysis_jobs aj
+            where aj.image_sha256 is null
+              and ($1 = '' or aj.job_key ilike $2 or aj.url ilike $2 or aj.event_id ilike $2)
+        )
+        select count(*) from rows
         "#,
     )
     .bind(search.trim())
@@ -322,22 +351,61 @@ async fn images(
 
     let rows = sqlx::query(
         r#"
-        select i.sha256, i.url, i.mime_type, i.width, i.height, i.bytes, i.first_seen_at,
-               v.status, v.labels, v.confidence, v.source, v.model_version, v.explanation,
-               v.created_at as verdict_created_at,
-               coalesce(array_agg(distinct ei.event_id) filter (where ei.event_id is not null), '{}') as event_ids
-        from images i
-        left join event_images ei on ei.image_id = i.id
-        left join lateral (
-            select status, labels, confidence, source, model_version, explanation, created_at
-            from verdicts
-            where target_type = 'image' and target_id = i.sha256
-            order by created_at desc
-            limit 1
-        ) v on true
-        where $1 = '' or i.sha256 ilike $2 or i.url ilike $2 or ei.event_id ilike $2
-        group by i.id, v.status, v.labels, v.confidence, v.source, v.model_version, v.explanation, v.created_at
-        order by coalesce(v.created_at, i.first_seen_at) desc
+        with rows as (
+            select 'image'::text as media_type, i.sha256, i.url, i.mime_type, i.width, i.height, i.bytes, i.first_seen_at,
+                   v.status, v.labels, v.confidence, v.source, v.model_version, v.explanation, v.provider_response,
+                   v.created_at as verdict_created_at,
+                   ij.status as job_status, ij.last_error as job_error, ij.updated_at as job_updated_at,
+                   coalesce(array_agg(distinct ei.event_id) filter (where ei.event_id is not null), '{}') as event_ids,
+                   coalesce(ij.updated_at, v.created_at, i.first_seen_at) as sort_at
+            from images i
+            left join event_images ei on ei.image_id = i.id
+            left join image_jobs ij on ij.sha256 = i.sha256
+            left join lateral (
+                select status, labels, confidence, source, model_version, explanation, provider_response, created_at
+                from verdicts
+                where target_type = 'image' and target_id = i.sha256
+                order by created_at desc
+                limit 1
+            ) v on true
+            where $1 = '' or i.sha256 ilike $2 or i.url ilike $2 or ei.event_id ilike $2
+            group by i.id, ij.status, ij.last_error, ij.updated_at, v.status, v.labels, v.confidence, v.source, v.model_version, v.explanation, v.provider_response, v.created_at
+            union all
+            select 'video'::text as media_type, vid.sha256, vid.url, vid.mime_type, null::integer as width, null::integer as height,
+                   vid.bytes, vid.first_seen_at,
+                   vv.status, vv.labels, vv.confidence, vv.source, vv.model_version, vv.explanation, vv.provider_response,
+                   vv.created_at as verdict_created_at,
+                   aj.status as job_status, aj.last_error as job_error, aj.updated_at as job_updated_at,
+                   coalesce(array_agg(distinct ev.event_id) filter (where ev.event_id is not null), '{}') as event_ids,
+                   coalesce(aj.updated_at, vv.created_at, vid.first_seen_at) as sort_at
+            from videos vid
+            left join event_videos ev on ev.video_id = vid.id
+            left join analysis_jobs aj on aj.image_sha256 = vid.sha256 and aj.media_type = 'video'
+            left join lateral (
+                select status, labels, confidence, source, model_version, explanation, provider_response, created_at
+                from verdicts
+                where target_type = 'video' and target_id = vid.sha256
+                order by created_at desc
+                limit 1
+            ) vv on true
+            where $1 = '' or vid.sha256 ilike $2 or vid.url ilike $2 or ev.event_id ilike $2
+            group by vid.id, aj.status, aj.last_error, aj.updated_at, vv.status, vv.labels, vv.confidence, vv.source, vv.model_version, vv.explanation, vv.provider_response, vv.created_at
+            union all
+            select coalesce(aj.media_type, 'image') as media_type, null::text as sha256, aj.url, null::text as mime_type, null::integer as width, null::integer as height,
+                   null::integer as bytes, aj.queued_at as first_seen_at,
+                   null::text as status, null::jsonb as labels, null::real as confidence, null::text as source,
+                   null::text as model_version, null::text as explanation, null::jsonb as provider_response, null::timestamptz as verdict_created_at,
+                   aj.status as job_status, aj.last_error as job_error, aj.updated_at as job_updated_at,
+                   array[aj.event_id] as event_ids, aj.updated_at as sort_at
+            from analysis_jobs aj
+            where aj.image_sha256 is null
+              and ($1 = '' or aj.job_key ilike $2 or aj.url ilike $2 or aj.event_id ilike $2)
+        )
+        select media_type, sha256, url, mime_type, width, height, bytes, first_seen_at,
+               status, labels, confidence, source, model_version, explanation, provider_response,
+               verdict_created_at, job_status, job_error, job_updated_at, event_ids
+        from rows
+        order by sort_at desc
         limit $3 offset $4
         "#,
     )
@@ -353,6 +421,7 @@ async fn images(
         let labels_value: Option<serde_json::Value> = row.try_get("labels")?;
         let labels = labels_value.and_then(|value| serde_json::from_value(value).ok()).unwrap_or_default();
         items.push(ImageRow {
+            media_type: row.try_get("media_type")?,
             sha256: row.try_get("sha256")?,
             url: row.try_get("url")?,
             mime_type: row.try_get("mime_type")?,
@@ -366,7 +435,11 @@ async fn images(
             source: row.try_get("source")?,
             model_version: row.try_get("model_version")?,
             explanation: row.try_get("explanation")?,
+            provider_response: row.try_get("provider_response")?,
             verdict_created_at: row.try_get("verdict_created_at")?,
+            job_status: row.try_get("job_status")?,
+            job_error: row.try_get("job_error")?,
+            job_updated_at: row.try_get("job_updated_at")?,
             event_ids: row.try_get("event_ids")?,
         });
     }
@@ -380,14 +453,32 @@ async fn change_image_verdict(
     Path(sha256): Path<String>,
     Json(req): Json<ChangeVerdictRequest>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
+    change_media_verdict(state, headers, sha256, req, TargetType::Image).await
+}
+
+async fn change_video_verdict(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(sha256): Path<String>,
+    Json(req): Json<ChangeVerdictRequest>,
+) -> Result<Json<serde_json::Value>, AdminError> {
+    change_media_verdict(state, headers, sha256, req, TargetType::Video).await
+}
+
+async fn change_media_verdict(
+    state: AppState,
+    headers: HeaderMap,
+    sha256: String,
+    req: ChangeVerdictRequest,
+    target_type: TargetType,
+) -> Result<Json<serde_json::Value>, AdminError> {
     let pool = authed_pool(&state, &headers).await?;
-    if sha256.len() != 64 || !sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(AdminError::bad_request("invalid image sha256"));
-    }
+    ensure_admin_schema(pool).await?;
+    validate_sha256(&sha256)?;
     if req.labels.is_empty() || req.labels.iter().any(|label| label.len() > 64) {
         return Err(AdminError::bad_request("labels are required and must be short"));
     }
-    let verdict = verdict_from_review(sha256, req);
+    let verdict = verdict_from_review(sha256, req, target_type);
     sqlx::query(
         r#"
         insert into verdicts
@@ -413,6 +504,116 @@ async fn change_image_verdict(
     .bind(&verdict.explanation)
     .execute(pool)
     .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn recheck_image(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(sha256): Path<String>,
+) -> Result<Json<serde_json::Value>, AdminError> {
+    let pool = authed_pool(&state, &headers).await?;
+    validate_sha256(&sha256)?;
+    let Some(url): Option<String> = sqlx::query_scalar("select url from images where sha256 = $1")
+        .bind(&sha256)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Err(AdminError::not_found("image not found"));
+    };
+
+    let event_id = format!("admin-recheck:{}:{}", &sha256[..12], now_unix_seconds());
+    sqlx::query(
+        r#"
+        insert into image_jobs (sha256, status, last_error, queued_at, started_at, finished_at, updated_at)
+        values ($1, 'queued', null, now(), null, null, now())
+        on conflict (sha256) do update set
+          status = excluded.status,
+          last_error = null,
+          queued_at = now(),
+          started_at = null,
+          finished_at = null,
+          updated_at = now()
+        "#,
+    )
+    .bind(&sha256)
+    .execute(pool)
+    .await?;
+    state
+        .queue
+        .enqueue(
+            &AnalysisJob {
+                event_id,
+                pubkey: None,
+                image_urls: vec![url],
+                video_urls: vec![],
+                image_sha256: Some(sha256),
+                force_recheck: true,
+                image_only: true,
+            },
+            admin_queue_stream_maxlen(&state).await,
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn recheck_video(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(sha256): Path<String>,
+) -> Result<Json<serde_json::Value>, AdminError> {
+    let pool = authed_pool(&state, &headers).await?;
+    validate_sha256(&sha256)?;
+    let Some(url): Option<String> = sqlx::query_scalar("select url from videos where sha256 = $1")
+        .bind(&sha256)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Err(AdminError::not_found("video not found"));
+    };
+
+    let event_id = format!("admin-recheck-video:{}:{}", &sha256[..12], now_unix_seconds());
+    sqlx::query(
+        r#"
+        insert into analysis_jobs
+          (job_key, event_id, url, media_type, image_sha256, status, last_error, queued_at, started_at, finished_at, updated_at)
+        values ($1, $2, $3, 'video', $4, 'queued', null, now(), null, null, now())
+        on conflict (job_key) do update set
+          media_type = 'video',
+          image_sha256 = excluded.image_sha256,
+          status = excluded.status,
+          last_error = null,
+          queued_at = now(),
+          started_at = null,
+          finished_at = null,
+          updated_at = now()
+        "#,
+    )
+    .bind(analysis_job_key(&event_id, &url))
+    .bind(&event_id)
+    .bind(&url)
+    .bind(&sha256)
+    .execute(pool)
+    .await?;
+    state
+        .queue
+        .enqueue(
+            &AnalysisJob {
+                event_id,
+                pubkey: None,
+                image_urls: vec![],
+                video_urls: vec![url],
+                image_sha256: None,
+                force_recheck: true,
+                image_only: true,
+            },
+            admin_queue_stream_maxlen(&state).await,
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -501,6 +702,9 @@ async fn authed_pool<'a>(state: &'a AppState, headers: &HeaderMap) -> Result<&'a
 }
 
 async fn ensure_admin_schema(pool: &PgPool) -> Result<()> {
+    sqlx::query("alter table if exists verdicts add column if not exists provider_response jsonb")
+        .execute(pool)
+        .await?;
     for statement in [
         r#"
         create table if not exists admin_users (
@@ -533,9 +737,56 @@ async fn ensure_admin_schema(pool: &PgPool) -> Result<()> {
           count integer not null default 0
         )
         "#,
+        r#"
+        create table if not exists image_jobs (
+          sha256 text primary key,
+          status text not null,
+          last_error text,
+          queued_at timestamptz not null default now(),
+          started_at timestamptz,
+          finished_at timestamptz,
+          updated_at timestamptz not null default now()
+        )
+        "#,
+        r#"
+        create table if not exists videos (
+          id uuid primary key,
+          url text not null,
+          normalized_url text not null,
+          sha256 text unique,
+          mime_type text,
+          bytes integer,
+          first_seen_at timestamptz not null default now()
+        )
+        "#,
+        r#"
+        create table if not exists event_videos (
+          event_id text not null references events(id) on delete cascade,
+          video_id uuid not null references videos(id) on delete cascade,
+          primary key (event_id, video_id)
+        )
+        "#,
+        r#"
+        create table if not exists analysis_jobs (
+          job_key text primary key,
+          event_id text not null,
+          url text not null,
+          media_type text not null default 'image',
+          image_sha256 text,
+          status text not null,
+          last_error text,
+          queued_at timestamptz not null default now(),
+          started_at timestamptz,
+          finished_at timestamptz,
+          updated_at timestamptz not null default now()
+        )
+        "#,
     ] {
         sqlx::query(statement).execute(pool).await?;
     }
+    sqlx::query("alter table analysis_jobs add column if not exists media_type text not null default 'image'")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -643,6 +894,22 @@ async fn queue_counts(state: &AppState) -> (i64, i64, i64) {
     (queued, retry, dead)
 }
 
+async fn admin_queue_stream_maxlen(state: &AppState) -> usize {
+    state
+        .store
+        .admin_setting_value("QUEUE_STREAM_MAXLEN")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            std::env::var("QUEUE_STREAM_MAXLEN")
+                .ok()
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(DEFAULT_STREAM_MAXLEN)
+}
+
 async fn relay_statuses(pool: &PgPool, state: &AppState) -> Vec<RelayStatus> {
     let relays = current_settings(pool)
         .await
@@ -689,7 +956,29 @@ fn csv_value(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn verdict_from_review(sha256: String, req: ChangeVerdictRequest) -> Verdict {
+fn validate_sha256(sha256: &str) -> Result<(), AdminError> {
+    if sha256.len() != 64 || !sha256.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(AdminError::bad_request("invalid image sha256"));
+    }
+    Ok(())
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn analysis_job_key(event_id: &str, url: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(event_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(url.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn verdict_from_review(sha256: String, req: ChangeVerdictRequest, target_type: TargetType) -> Verdict {
     let safe = matches!(req.status, VerdictStatus::Safe);
     let warn = matches!(req.status, VerdictStatus::Warn);
     let block = matches!(req.status, VerdictStatus::Block);
@@ -697,7 +986,7 @@ fn verdict_from_review(sha256: String, req: ChangeVerdictRequest) -> Verdict {
     let error = matches!(req.status, VerdictStatus::Error);
     Verdict {
         id: Uuid::new_v4(),
-        target_type: TargetType::Image,
+        target_type,
         target_id: sha256,
         status: req.status,
         safe,
@@ -726,7 +1015,10 @@ fn setting_specs(state: &AppState) -> Vec<SettingSpec> {
         SettingSpec { key: "DEFAULT_POLICY", value: state.config.default_policy.clone(), secret: false },
         SettingSpec { key: "ENABLE_ESCALATION", value: state.config.enable_escalation.to_string(), secret: false },
         SettingSpec { key: "MAX_IMAGE_BYTES", value: state.config.max_image_bytes.to_string(), secret: false },
+        SettingSpec { key: "MAX_VIDEO_BYTES", value: std::env::var("MAX_VIDEO_BYTES").unwrap_or_else(|_| "50000000".to_string()), secret: false },
         SettingSpec { key: "IMAGE_FETCH_TIMEOUT_SECONDS", value: state.config.image_fetch_timeout.as_secs().to_string(), secret: false },
+        SettingSpec { key: "MAX_VIDEO_FRAMES", value: std::env::var("MAX_VIDEO_FRAMES").unwrap_or_else(|_| "8".to_string()), secret: false },
+        SettingSpec { key: "VIDEO_FRAME_INTERVAL_SECONDS", value: std::env::var("VIDEO_FRAME_INTERVAL_SECONDS").unwrap_or_else(|_| "5".to_string()), secret: false },
         SettingSpec { key: "WORKER_CONCURRENCY", value: state.config.worker_concurrency.to_string(), secret: false },
         SettingSpec { key: "QUEUE_STREAM_MAXLEN", value: std::env::var("QUEUE_STREAM_MAXLEN").unwrap_or_else(|_| "1000000".to_string()), secret: false },
         SettingSpec { key: "QUEUE_DEAD_LETTER_MAXLEN", value: std::env::var("QUEUE_DEAD_LETTER_MAXLEN").unwrap_or_else(|_| "100000".to_string()), secret: false },
@@ -776,7 +1068,7 @@ fn validate_setting_value(key: &str, value: &str) -> Result<(), AdminError> {
         "ENABLE_ESCALATION" => value.parse::<bool>().map(|_| ()).map_err(|_| AdminError::bad_request("ENABLE_ESCALATION must be true or false")),
         "MODERATION_PROVIDER" if matches!(value, "deterministic" | "openai") => Ok(()),
         "MODERATION_PROVIDER" => Err(AdminError::bad_request("MODERATION_PROVIDER must be deterministic or openai")),
-        "MAX_IMAGE_BYTES" | "IMAGE_FETCH_TIMEOUT_SECONDS" | "WORKER_CONCURRENCY" | "QUEUE_STREAM_MAXLEN" | "QUEUE_DEAD_LETTER_MAXLEN" | "RATE_LIMIT_CHECKS_PER_MINUTE" => {
+        "MAX_IMAGE_BYTES" | "MAX_VIDEO_BYTES" | "IMAGE_FETCH_TIMEOUT_SECONDS" | "MAX_VIDEO_FRAMES" | "VIDEO_FRAME_INTERVAL_SECONDS" | "WORKER_CONCURRENCY" | "QUEUE_STREAM_MAXLEN" | "QUEUE_DEAD_LETTER_MAXLEN" | "RATE_LIMIT_CHECKS_PER_MINUTE" => {
             value.parse::<usize>().map(|_| ()).map_err(|_| AdminError::bad_request(format!("{key} must be a positive number")))
         }
         _ => Ok(()),
