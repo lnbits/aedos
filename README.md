@@ -236,6 +236,27 @@ When `ENABLE_LABEL_PUBLISHER=true`, `NOSTR_PRIVATE_KEY` is set, and `NOSTR_RELAY
 
 There is also a configurable realtime event draft kind, `ORACLE_VERDICT_KIND`, defaulting to `31494`. That is Aedos-specific and useful for direct integrations, but NIP-32 kind `1985` is the standards-aligned format clients and relays should prefer.
 
+## Relay And Client Integration
+
+Relays and clients can use Aedos in two ways:
+
+- Query the HTTP/WebSocket API directly when they see an event.
+- Consume NIP-32 label events from trusted Aedos label pubkeys.
+
+For a copy/paste handoff to another coding agent, use [docs/INTEGRATION_AGENT_PROMPT.md](docs/INTEGRATION_AGENT_PROMPT.md). It explains the expected relay/client behavior, API shapes, fallback policies, NIP-32 label consumption, and tests an integration should add.
+
+Recommended relay behavior:
+
+- Use `POST /v1/check` with `wait=true` if the relay needs a verdict before storing or sharing an event.
+- Use `/v1/ws` if the relay can queue or quarantine unknown media and apply the final verdict when it arrives.
+- Treat `safe` as accept, `warn` as configurable mark/blur/downrank, `block` as reject/hide, and `unknown`/`error` according to the relay operator's fallback policy.
+
+Recommended client behavior:
+
+- Prefer verified NIP-32 labels from trusted Aedos pubkeys when available.
+- Query Aedos only when no trusted label is available or when the client wants a fresher check.
+- Blur/collapse `warn` media by default, hide `block` media, and make `unknown` behavior user-configurable.
+
 ## Dashboard
 
 The dashboard runs at:
