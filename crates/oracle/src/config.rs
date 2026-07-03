@@ -32,13 +32,17 @@ impl Config {
             .parse()
             .context("HTTP_BIND must be host:port")?;
 
+        let public_base_url = optional_env("PUBLIC_BASE_URL");
+        let label_namespace = optional_env("LABEL_NAMESPACE")
+            .unwrap_or_else(|| default_label_namespace(public_base_url.as_deref()));
+
         Ok(Self {
             database_url: optional_env("DATABASE_URL"),
             redis_url: optional_env("REDIS_URL"),
             nostr_private_key: optional_env("NOSTR_PRIVATE_KEY"),
             nostr_relays: csv_env("NOSTR_RELAYS"),
-            public_base_url: optional_env("PUBLIC_BASE_URL"),
-            label_namespace: env::var("LABEL_NAMESPACE").unwrap_or_else(|_| "nostr.com/moderation".to_string()),
+            public_base_url,
+            label_namespace,
             default_policy: env::var("DEFAULT_POLICY").unwrap_or_else(|_| "blur_unknown".to_string()),
             enable_escalation: bool_env("ENABLE_ESCALATION", false),
             max_image_bytes: env_usize("MAX_IMAGE_BYTES", 10_000_000),
@@ -78,6 +82,12 @@ impl Config {
     }
 }
 
+fn default_label_namespace(public_base_url: Option<&str>) -> String {
+    public_base_url
+        .map(|url| format!("{}/moderation", url.trim_end_matches('/')))
+        .unwrap_or_else(|| "http://localhost:8080/moderation".to_string())
+}
+
 fn optional_env(key: &str) -> Option<String> {
     env::var(key).ok().filter(|value| !value.trim().is_empty())
 }
@@ -111,4 +121,17 @@ fn env_usize(key: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_label_namespace;
+
+    #[test]
+    fn label_namespace_defaults_to_public_moderation_url() {
+        assert_eq!(
+            default_label_namespace(Some("https://aedos.example/")),
+            "https://aedos.example/moderation"
+        );
+    }
 }

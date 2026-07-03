@@ -1096,6 +1096,8 @@ fn setting_specs(state: &AppState) -> Vec<SettingSpec> {
         SettingSpec { key: "QUEUE_STREAM_MAXLEN", value: std::env::var("QUEUE_STREAM_MAXLEN").unwrap_or_else(|_| "1000000".to_string()), secret: false },
         SettingSpec { key: "QUEUE_DEAD_LETTER_MAXLEN", value: std::env::var("QUEUE_DEAD_LETTER_MAXLEN").unwrap_or_else(|_| "100000".to_string()), secret: false },
         SettingSpec { key: "RATE_LIMIT_CHECKS_PER_MINUTE", value: std::env::var("RATE_LIMIT_CHECKS_PER_MINUTE").unwrap_or_else(|_| "120".to_string()), secret: false },
+        SettingSpec { key: "TEXT_MARKERS_NSFW", value: std::env::var("TEXT_MARKERS_NSFW").unwrap_or_else(|_| "nsfw,porn,porno,xxx,nude,nudes,nudity,sex,sexual,teen".to_string()), secret: false },
+        SettingSpec { key: "TEXT_MARKERS_CSAM", value: std::env::var("TEXT_MARKERS_CSAM").unwrap_or_else(|_| "csam,pedo,paedo,p3do,loli,lolicon,shota,toddler".to_string()), secret: false },
         SettingSpec { key: "MODERATION_PROVIDER", value: std::env::var("MODERATION_PROVIDER").unwrap_or_else(|_| "deterministic".to_string()), secret: false },
         SettingSpec { key: "OPENAI_API_KEY", value: std::env::var("OPENAI_API_KEY").unwrap_or_default(), secret: true },
         SettingSpec { key: "OPENAI_MODERATION_MODEL", value: std::env::var("OPENAI_MODERATION_MODEL").unwrap_or_else(|_| "omni-moderation-latest".to_string()), secret: false },
@@ -1144,8 +1146,38 @@ fn validate_setting_value(key: &str, value: &str) -> Result<(), AdminError> {
         "MAX_IMAGE_BYTES" | "MAX_VIDEO_BYTES" | "IMAGE_FETCH_TIMEOUT_SECONDS" | "MAX_VIDEO_FRAMES" | "VIDEO_FRAME_INTERVAL_SECONDS" | "WORKER_CONCURRENCY" | "QUEUE_STREAM_MAXLEN" | "QUEUE_DEAD_LETTER_MAXLEN" | "RATE_LIMIT_CHECKS_PER_MINUTE" => {
             value.parse::<usize>().map(|_| ()).map_err(|_| AdminError::bad_request(format!("{key} must be a positive number")))
         }
+        "TEXT_MARKERS_NSFW" | "TEXT_MARKERS_CSAM" => validate_text_markers(value),
         _ => Ok(()),
     }
+}
+
+fn validate_text_markers(value: &str) -> Result<(), AdminError> {
+    let markers = parse_marker_setting(value);
+    if markers.is_empty() {
+        return Err(AdminError::bad_request("text marker list must include at least one marker"));
+    }
+    if markers.len() > 256 {
+        return Err(AdminError::bad_request("text marker list has too many markers"));
+    }
+    Ok(())
+}
+
+fn parse_marker_setting(value: &str) -> Vec<String> {
+    value
+        .split(|ch: char| ch == ',' || ch == '\n' || ch == '\r' || ch.is_whitespace())
+        .map(normalize_text_marker)
+        .filter(|marker| !marker.is_empty())
+        .collect()
+}
+
+fn normalize_text_marker(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('#')
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 pub async fn check_rate_limit(state: &AppState, key: &str, limit_key: &str, default_limit: i64) -> Result<(), AdminError> {

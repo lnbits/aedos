@@ -18,12 +18,14 @@ Nostr gives users, clients, and relays freedom, but it also means every app is l
 - Provides a SvelteKit admin dashboard with login, stats, media review, recheck actions, settings, theme toggle, relay status, and job error visibility.
 - Generates NIP-32 label drafts using kind `1985`.
 - Publishes stored event verdicts as NIP-32 labels when `NOSTR_PRIVATE_KEY`, `NOSTR_RELAYS`, and `ENABLE_LABEL_PUBLISHER=true` are configured.
+- Serves a public moderation policy page at `/moderation`; by default the NIP-32 label namespace is derived from `PUBLIC_BASE_URL + /moderation`.
 
 ## Current Limits
 
 - Relay publishing is implemented as a background publisher for stored event verdicts. It still needs real relay soak testing before being treated as relay-scale infrastructure.
 - Video review checks sampled visual frames only. It does not inspect audio, subtitles, or HLS playlists.
 - The text review layer is rule-based and focused on explicit Nostr tags/hashtags.
+- Text marker lists are configurable from the dashboard. They only match hashtags and Nostr `t` tags, not arbitrary plain-text mentions.
 - OpenAI OAuth is not used. Aedos currently expects an API key.
 - `csam-suspected` records are moderation signals for operator/legal process. Aedos does not store image or video bytes for these escalations.
 
@@ -66,15 +68,27 @@ This starts:
 - Redis
 - Rust oracle API
 - Python moderation worker
-- SvelteKit admin dashboard
+- SvelteKit public page and admin dashboard
 
-Open the dashboard:
+Open Aedos:
 
 ```text
 http://localhost:3000
 ```
 
-On first load, create the first admin account. The dashboard stores the password with Argon2 and uses an HttpOnly, SameSite session cookie.
+Operator login and first-install setup live at:
+
+```text
+http://localhost:3000/login
+```
+
+The admin control surface lives at:
+
+```text
+http://localhost:3000/admin
+```
+
+On first login, create the first admin account. The dashboard stores the password with Argon2 and uses an HttpOnly, SameSite session cookie.
 
 If `API_KEYS` is set, public `/v1/*` and `/metrics` requests must include one of the configured keys:
 
@@ -91,6 +105,12 @@ Check the API:
 
 ```bash
 curl http://localhost:8080/health
+```
+
+Open the public moderation policy page:
+
+```text
+http://localhost:8080/moderation
 ```
 
 Stop the stack:
@@ -253,6 +273,15 @@ Target tags:
 
 When `ENABLE_LABEL_PUBLISHER=true`, `NOSTR_PRIVATE_KEY` is set, and `NOSTR_RELAYS` contains at least one relay, the Rust API process scans final stored event verdicts and publishes NIP-32 label events in the background. Published label drafts and their Nostr event IDs are recorded in `published_labels` to avoid repeat publishing.
 
+If `LABEL_NAMESPACE` is not explicitly set, Aedos derives it from `PUBLIC_BASE_URL`:
+
+```text
+PUBLIC_BASE_URL=https://your-aedos.example
+LABEL_NAMESPACE=https://your-aedos.example/moderation
+```
+
+That URL is served by Aedos as a public, non-secret moderation policy page explaining what the instance does, what provider class it uses, which labels it emits, and how its tag rules work.
+
 There is also a configurable realtime event draft kind, `ORACLE_VERDICT_KIND`, defaulting to `31494`. That is Aedos-specific and useful for direct integrations, but NIP-32 kind `1985` is the standards-aligned format clients and relays should prefer.
 
 ## Relay And Client Integration
@@ -277,15 +306,21 @@ Recommended client behavior:
 - Query Aedos only when no trusted label is available or when the client wants a fresher check.
 - Blur/collapse `warn` media by default, hide `block` media, and make `unknown` behavior user-configurable.
 
-## Dashboard
+## Public Page And Dashboard
 
-The dashboard runs at:
+The SvelteKit app runs at:
 
 ```text
 http://localhost:3000
 ```
 
-It includes:
+Routes:
+
+- `/`: public Aedos explainer page.
+- `/login`: operator login and first-install admin setup.
+- `/admin`: authenticated control surface.
+
+The admin dashboard includes:
 
 - First-install admin setup.
 - Login/logout using server-side sessions.
@@ -318,6 +353,13 @@ Hot-applied worker/provider settings:
 Public API rate limiting is controlled by:
 
 - `RATE_LIMIT_CHECKS_PER_MINUTE`
+
+Text tag review is controlled by:
+
+- `TEXT_MARKERS_NSFW`
+- `TEXT_MARKERS_CSAM`
+
+These are comma, whitespace, or newline separated marker lists. They match only note hashtags such as `#nsfw` and Nostr topic tags such as `["t", "nsfw"]`; they do not match plain text sentences that merely mention a word.
 
 Boot-level settings still require restarting the relevant service after editing `.env`, such as database URLs, Redis URLs, bind ports, and Compose port mappings.
 
@@ -406,6 +448,7 @@ Public API:
 - `GET /v1/npubs/csam`
 - `GET /v1/ws`
 - `GET /v1/ws/firehose`
+- `GET /moderation`
 - `GET /health`
 - `GET /metrics`
 
@@ -505,6 +548,7 @@ See `.env.example` for defaults. Important values:
 - `REDIS_URL`
 - `NOSTR_PRIVATE_KEY`
 - `NOSTR_RELAYS`
+- `PUBLIC_BASE_URL`
 - `ALLOWED_ORIGINS`
 - `SECURE_COOKIES`
 - `LABEL_NAMESPACE`
@@ -522,6 +566,8 @@ See `.env.example` for defaults. Important values:
 - `QUEUE_STREAM_MAXLEN`
 - `QUEUE_DEAD_LETTER_MAXLEN`
 - `RATE_LIMIT_CHECKS_PER_MINUTE`
+- `TEXT_MARKERS_NSFW`
+- `TEXT_MARKERS_CSAM`
 - `MODERATION_PROVIDER`
 - `OPENAI_API_KEY`
 - `OPENAI_MODERATION_MODEL`

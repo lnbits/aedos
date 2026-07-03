@@ -6,9 +6,9 @@ use std::{
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderValue, Method, Request, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -31,7 +31,7 @@ use crate::{
     queue::{AnalysisJob, Queue, DEFAULT_STREAM_MAXLEN},
     types::{
         BatchCheckRequest, BatchEvent, CheckRequest, SubmitRequest, TargetType, Verdict,
-        VerdictResponse, VerdictStatus,
+        VerdictResponse, VerdictStatus, SUPPORTED_LABELS,
     },
     websocket::{firehose_ws_handler, ws_handler},
 };
@@ -54,6 +54,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(admin::router())
         .route("/health", get(health))
+        .route("/moderation", get(moderation_policy_page))
         .route("/metrics", get(metrics))
         .route("/v1/check", post(check))
         .route("/v1/submit", post(submit))
@@ -176,6 +177,172 @@ async fn metrics(State(state): State<AppState>) -> String {
     state.metrics.render_prometheus()
 }
 
+async fn moderation_policy_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Html<String>, ApiError> {
+    let provider = public_setting(&state, "MODERATION_PROVIDER", "deterministic").await?;
+    let model = public_setting(&state, "OPENAI_MODERATION_MODEL", "omni-moderation-latest").await?;
+    let nsfw_markers = public_setting(
+        &state,
+        "TEXT_MARKERS_NSFW",
+        "nsfw,porn,porno,xxx,nude,nudes,nudity,sex,sexual,teen",
+    )
+    .await?;
+    let csam_markers = public_setting(
+        &state,
+        "TEXT_MARKERS_CSAM",
+        "csam,pedo,paedo,p3do,loli,lolicon,shota,toddler",
+    )
+    .await?;
+    let policy_url = state
+        .config
+        .public_base_url
+        .as_deref()
+        .map(|url| format!("{}/moderation", url.trim_end_matches('/')))
+        .or_else(|| request_origin(&headers).map(|origin| format!("{origin}/moderation")))
+        .unwrap_or_else(|| state.config.label_namespace.clone());
+    let provider_label = if provider == "openai" {
+        "OpenAI Moderation"
+    } else {
+        "Local deterministic test model"
+    };
+    let provider_note = if provider == "openai" {
+        "Aedos sends fetched image content and sampled video frames to the configured OpenAI moderation model. API keys are not exposed on this page."
+    } else {
+        "Aedos is using its local deterministic development reviewer. This is useful for testing, but it is not a production AI reviewer."
+    };
+    let page = format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Aedos Moderation Policy</title>
+  <style>
+    :root {{ color-scheme: light dark; --bg: #fffdf8; --text: #080808; --muted: #55545c; --line: #55545c; --panel: rgba(255,255,255,0.62); }}
+    @media (prefers-color-scheme: dark) {{ :root {{ --bg: #000; --text: #f4f4f1; --muted: #b5b2ac; --line: #55545c; --panel: #080808; }} }}
+    body {{ margin: 0; background: var(--bg); color: var(--text); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    main {{ max-width: 960px; margin: 0 auto; padding: 56px 20px 72px; }}
+    header {{ border-bottom: 1px solid var(--line); padding-bottom: 28px; margin-bottom: 28px; }}
+    h1 {{ font-size: clamp(2rem, 5vw, 4.4rem); letter-spacing: 0.18em; margin: 0 0 14px; }}
+    h2 {{ margin: 34px 0 12px; font-size: 1rem; text-transform: uppercase; letter-spacing: 0.08em; }}
+    p, li {{ color: var(--muted); line-height: 1.6; }}
+    a {{ color: inherit; }}
+    dl {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1px; border: 1px solid var(--line); background: var(--line); }}
+    div.metric {{ background: var(--bg); padding: 16px; }}
+    dt {{ color: var(--muted); font-size: 0.75rem; text-transform: uppercase; font-weight: 800; margin-bottom: 8px; }}
+    dd {{ margin: 0; font-weight: 800; overflow-wrap: anywhere; }}
+    code, pre {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+    pre {{ white-space: pre-wrap; border: 1px solid var(--line); padding: 14px; overflow: auto; }}
+    .pill-list {{ display: flex; gap: 8px; flex-wrap: wrap; padding: 0; list-style: none; }}
+    .pill-list li {{ border: 1px solid var(--line); padding: 6px 9px; color: var(--text); }}
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>AEDOS</h1>
+      <p>Aedos is a self-hosted moderation oracle for Nostr. It reviews submitted events, text tags, images, and videos, caches verdicts, and can publish NIP-32 moderation labels for clients and relays that choose to trust this instance.</p>
+    </header>
+
+    <dl>
+      <div class="metric"><dt>Policy URL</dt><dd>{policy_url}</dd></div>
+      <div class="metric"><dt>Label Namespace</dt><dd>{namespace}</dd></div>
+      <div class="metric"><dt>AI Provider</dt><dd>{provider_label}</dd></div>
+      <div class="metric"><dt>Model</dt><dd>{model}</dd></div>
+    </dl>
+
+    <h2>Provider</h2>
+    <p>{provider_note}</p>
+
+    <h2>Verdict Labels</h2>
+    <ul class="pill-list">{labels}</ul>
+
+    <h2>Text And Tag Rules</h2>
+    <p>Text rules match only note hashtags and Nostr <code>["t", "..."]</code> topic tags. They do not match ordinary prose that merely mentions a word.</p>
+    <p><strong>NSFW markers:</strong> {nsfw_markers}</p>
+    <p><strong>CSAM-suspected markers:</strong> {csam_markers}</p>
+
+    <h2>Media Review</h2>
+    <p>Aedos stores event IDs, media URLs, media hashes, verdicts, and compact provider response metadata. It does not store image or video bytes in Postgres.</p>
+    <p>Video review samples visual frames only. Audio, subtitles, and playlist contents are not inspected.</p>
+
+    <h2>Nostr Labels</h2>
+    <p>When label publishing is enabled, Aedos publishes NIP-32 kind <code>1985</code> label events under the namespace above. Clients and relays should verify the label event signature and trust only configured Aedos public keys.</p>
+    <pre>{example_label}</pre>
+
+    <h2>Integration</h2>
+    <p>Relays and clients can query verdicts over HTTP or WebSocket. Trusted peers may use a key-protected firehose WebSocket if the operator enables API keys for them.</p>
+  </main>
+</body>
+</html>"#,
+        policy_url = escape_html(&policy_url),
+        namespace = escape_html(&state.config.label_namespace),
+        provider_label = escape_html(provider_label),
+        model = escape_html(&model),
+        provider_note = escape_html(provider_note),
+        labels = supported_labels_html(),
+        nsfw_markers = escape_html(&nsfw_markers),
+        csam_markers = escape_html(&csam_markers),
+        example_label = escape_html(&example_label_json(&state.config.label_namespace)),
+    );
+    Ok(Html(page))
+}
+
+async fn public_setting(state: &AppState, key: &str, default: &str) -> Result<String, ApiError> {
+    Ok(state
+        .store
+        .admin_setting_value(key)
+        .await
+        .map_err(anyhow::Error::from)?
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| default.to_string()))
+}
+
+fn request_origin(headers: &HeaderMap) -> Option<String> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())?;
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| matches!(*value, "http" | "https"))
+        .unwrap_or("http");
+    Some(format!("{proto}://{host}"))
+}
+
+fn supported_labels_html() -> String {
+    SUPPORTED_LABELS
+        .iter()
+        .map(|label| format!("<li>{}</li>", escape_html(label)))
+        .collect::<String>()
+}
+
+fn example_label_json(namespace: &str) -> String {
+    serde_json::to_string_pretty(&json!({
+        "kind": 1985,
+        "tags": [
+            ["L", namespace],
+            ["l", "nsfw", namespace],
+            ["e", "<event-id>"]
+        ],
+        "content": "{\"status\":\"warn\",\"confidence\":0.91,\"source\":\"aedos\"}"
+    }))
+    .unwrap_or_default()
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 async fn check(
     State(state): State<AppState>,
     Json(req): Json<CheckRequest>,
@@ -243,7 +410,7 @@ async fn submit(
     if let Some(raw_event) = raw_event {
         let request_pubkey = normalized_optional_pubkey(req.pubkey.as_deref())?;
         store_raw_event(state.store.pool(), &event_id, &raw_event, request_pubkey.as_deref()).await?;
-        if let Some(verdict) = text_verdict_from_raw_event(&event_id, &raw_event) {
+        if let Some(verdict) = text_verdict_from_raw_event(&state, &event_id, &raw_event).await? {
             state.store.store_verdict(&verdict).await?;
         }
         let (extracted_images, extracted_videos) = extract_urls_from_raw_event(&raw_event);
@@ -677,9 +844,29 @@ async fn store_event_shell(pool: Option<&PgPool>, event_id: &str, pubkey: Option
     Ok(())
 }
 
-fn text_verdict_from_raw_event(event_id: &str, raw_event: &Value) -> Option<Verdict> {
+async fn text_verdict_from_raw_event(
+    state: &AppState,
+    event_id: &str,
+    raw_event: &Value,
+) -> Result<Option<Verdict>, ApiError> {
+    let csam_markers = configured_text_markers(state, "TEXT_MARKERS_CSAM", CSAM_TEXT_MARKERS).await?;
+    let nsfw_markers = configured_text_markers(state, "TEXT_MARKERS_NSFW", NSFW_TEXT_MARKERS).await?;
+    Ok(text_verdict_from_raw_event_with_markers(
+        event_id,
+        raw_event,
+        &csam_markers,
+        &nsfw_markers,
+    ))
+}
+
+fn text_verdict_from_raw_event_with_markers(
+    event_id: &str,
+    raw_event: &Value,
+    csam_markers: &[String],
+    nsfw_markers: &[String],
+) -> Option<Verdict> {
     let tokens = text_review_tokens(raw_event);
-    let csam_matches = matched_terms(&tokens, CSAM_TEXT_MARKERS);
+    let csam_matches = matched_terms(&tokens, csam_markers);
     if !csam_matches.is_empty() {
         return Some(text_verdict(
             event_id,
@@ -690,7 +877,7 @@ fn text_verdict_from_raw_event(event_id: &str, raw_event: &Value) -> Option<Verd
         ));
     }
 
-    let nsfw_matches = matched_terms(&tokens, NSFW_TEXT_MARKERS);
+    let nsfw_matches = matched_terms(&tokens, nsfw_markers);
     if !nsfw_matches.is_empty() {
         return Some(text_verdict(
             event_id,
@@ -702,6 +889,25 @@ fn text_verdict_from_raw_event(event_id: &str, raw_event: &Value) -> Option<Verd
     }
 
     None
+}
+
+async fn configured_text_markers(
+    state: &AppState,
+    key: &str,
+    defaults: &[&str],
+) -> Result<Vec<String>, ApiError> {
+    let configured = state
+        .store
+        .admin_setting_value(key)
+        .await
+        .map_err(anyhow::Error::from)?
+        .unwrap_or_default();
+    let markers = parse_marker_setting(&configured);
+    if markers.is_empty() {
+        Ok(defaults.iter().map(|marker| (*marker).to_string()).collect())
+    } else {
+        Ok(markers)
+    }
 }
 
 const CSAM_TEXT_MARKERS: &[&str] = &[
@@ -725,6 +931,7 @@ const NSFW_TEXT_MARKERS: &[&str] = &[
     "nudity",
     "sex",
     "sexual",
+    "teen",
 ];
 
 fn text_review_tokens(raw_event: &Value) -> Vec<String> {
@@ -771,10 +978,21 @@ fn normalize_text_marker(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn matched_terms(tokens: &[String], markers: &[&str]) -> Vec<String> {
+fn parse_marker_setting(value: &str) -> Vec<String> {
+    let mut markers = value
+        .split(|ch: char| ch == ',' || ch == '\n' || ch == '\r' || ch.is_whitespace())
+        .map(normalize_text_marker)
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    markers.sort();
+    markers.dedup();
+    markers
+}
+
+fn matched_terms(tokens: &[String], markers: &[String]) -> Vec<String> {
     tokens
         .iter()
-        .filter(|token| markers.contains(&token.as_str()))
+        .filter(|token| markers.contains(token))
         .cloned()
         .collect()
 }
@@ -982,6 +1200,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn moderation_page_is_public_and_does_not_expose_secrets() {
+        let response = router(test_state_with_api_key())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/moderation")
+                    .header("host", "aedos.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let page = String::from_utf8(body.to_vec()).unwrap();
+        assert!(page.contains("Aedos Moderation Policy"));
+        assert!(page.contains("http://aedos.example/moderation"));
+        assert!(!page.contains("secret-test-key"));
+    }
+
+    #[tokio::test]
     async fn firehose_requires_configured_api_keys() {
         let response = router(test_state())
             .oneshot(
@@ -1098,7 +1338,13 @@ mod tests {
             "tags": [["t", "loli"], ["t", "news"]]
         });
 
-        let verdict = text_verdict_from_raw_event("text-event", &raw_event).unwrap();
+        let verdict = text_verdict_from_raw_event_with_markers(
+            "text-event",
+            &raw_event,
+            &default_marker_vec(CSAM_TEXT_MARKERS),
+            &default_marker_vec(NSFW_TEXT_MARKERS),
+        )
+        .unwrap();
 
         assert_eq!(verdict.status, VerdictStatus::Block);
         assert_eq!(verdict.labels, vec!["csam-suspected"]);
@@ -1113,21 +1359,57 @@ mod tests {
             "tags": []
         });
 
-        let verdict = text_verdict_from_raw_event("text-event", &raw_event).unwrap();
+        let verdict = text_verdict_from_raw_event_with_markers(
+            "text-event",
+            &raw_event,
+            &default_marker_vec(CSAM_TEXT_MARKERS),
+            &default_marker_vec(NSFW_TEXT_MARKERS),
+        )
+        .unwrap();
 
         assert_eq!(verdict.status, VerdictStatus::Warn);
         assert!(verdict.labels.contains(&"nsfw".to_string()));
     }
 
     #[test]
-    fn text_detector_does_not_match_plain_words_without_hashtag_or_tag() {
+    fn text_detector_warns_teen_hashtag_by_default() {
         let raw_event = json!({
             "id": "text-event",
-            "content": "a normal toddler milestone note",
+            "content": "look #teen",
             "tags": []
         });
 
-        assert!(text_verdict_from_raw_event("text-event", &raw_event).is_none());
+        let verdict = text_verdict_from_raw_event_with_markers(
+            "text-event",
+            &raw_event,
+            &default_marker_vec(CSAM_TEXT_MARKERS),
+            &default_marker_vec(NSFW_TEXT_MARKERS),
+        )
+        .unwrap();
+
+        assert_eq!(verdict.status, VerdictStatus::Warn);
+        assert!(verdict.explanation.unwrap().contains("teen"));
+    }
+
+    #[test]
+    fn text_detector_does_not_match_plain_words_without_hashtag_or_tag() {
+        let raw_event = json!({
+            "id": "text-event",
+            "content": "I hate all the nudity on nostr and saw a normal toddler milestone note",
+            "tags": []
+        });
+
+        assert!(text_verdict_from_raw_event_with_markers(
+            "text-event",
+            &raw_event,
+            &default_marker_vec(CSAM_TEXT_MARKERS),
+            &default_marker_vec(NSFW_TEXT_MARKERS),
+        )
+        .is_none());
+    }
+
+    fn default_marker_vec(markers: &[&str]) -> Vec<String> {
+        markers.iter().map(|marker| (*marker).to_string()).collect()
     }
 
     #[test]
