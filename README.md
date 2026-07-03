@@ -85,7 +85,7 @@ curl -X POST http://localhost:8080/v1/check \
 
 `event_id` is required. `npub`/`pubkey`, `image_urls`, and `video_urls` are optional.
 
-The first response may be `unknown` while the worker downloads and reviews the media:
+By default, `/v1/check` queues new media and returns immediately. The first response may be `unknown` while the worker downloads and reviews the media:
 
 ```json
 {
@@ -99,6 +99,21 @@ The first response may be `unknown` while the worker downloads and reviews the m
 ```
 
 Later calls for the same event ID return the cached event verdict. New events with an already-seen image or video SHA-256 reuse the cached media verdict and do not call the AI provider again.
+
+For a one-request flow, add `wait: true`. Aedos will queue the work and hold the HTTP request open until the event verdict is stored, or until the timeout is reached.
+
+```bash
+curl -X POST http://localhost:8080/v1/check \
+  -H 'content-type: application/json' \
+  -d '{
+    "event_id": "example-event",
+    "image_urls": ["https://example.com/image.png"],
+    "wait": true,
+    "timeout_seconds": 30
+  }'
+```
+
+`timeout_seconds` defaults to `30` and is clamped between `1` and `60`. If the timeout is reached before processing finishes, Aedos still returns `unknown`; a later check will return the cached verdict.
 
 `POST /v1/submit` accepts a raw Nostr event. Aedos stores the event, extracts image/video URLs from the content, records the author, and checks text tags.
 
@@ -329,6 +344,20 @@ WebSocket batch check:
 
 ```json
 {"type":"check_batch","events":[{"event_id":"...","npub":"npub1...","image_urls":[],"video_urls":[]}]}
+```
+
+The WebSocket returns the current verdict immediately. If that verdict is `unknown` and the request queued media for review, the connection stays subscribed to that event ID and sends another `verdict` message when the worker stores the final result.
+
+You can also subscribe to existing event IDs without queueing new media:
+
+```json
+{"type":"subscribe","event_ids":["event1","event2"]}
+```
+
+Stop watching event IDs:
+
+```json
+{"type":"unsubscribe","event_ids":["event1"]}
 ```
 
 ## Environment

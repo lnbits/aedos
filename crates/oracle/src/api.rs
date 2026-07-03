@@ -1,4 +1,7 @@
-use std::{sync::Arc, sync::atomic::Ordering};
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use axum::{
@@ -12,6 +15,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::{
@@ -21,11 +25,18 @@ use crate::{
     images::{extract_image_urls, extract_video_urls, normalize_image_url, normalize_video_url},
     metrics::Metrics,
     queue::{AnalysisJob, Queue, DEFAULT_STREAM_MAXLEN},
-    types::{BatchCheckRequest, BatchEvent, CheckRequest, SubmitRequest, TargetType, Verdict, VerdictResponse, VerdictStatus},
+    types::{
+        BatchCheckRequest, BatchEvent, CheckRequest, SubmitRequest, TargetType, Verdict,
+        VerdictResponse, VerdictStatus,
+    },
     websocket::ws_handler,
 };
 
 use nostr_sdk::prelude::{PublicKey, ToBech32};
+
+const DEFAULT_WAIT_TIMEOUT_SECONDS: u64 = 30;
+const MAX_WAIT_TIMEOUT_SECONDS: u64 = 60;
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -65,19 +76,62 @@ async fn metrics(State(state): State<AppState>) -> String {
     state.metrics.render_prometheus()
 }
 
-async fn check(State(state): State<AppState>, Json(req): Json<CheckRequest>) -> Result<Json<VerdictResponse>, ApiError> {
+async fn check(
+    State(state): State<AppState>,
+    Json(req): Json<CheckRequest>,
+) -> Result<Json<VerdictResponse>, ApiError> {
     admin::check_rate_limit(&state, "public:check", "RATE_LIMIT_CHECKS_PER_MINUTE", 120).await?;
+    let wait = req.wait;
+    let timeout_seconds = req.timeout_seconds;
     let event = BatchEvent {
         event_id: req.event_id,
         pubkey: normalized_optional_pubkey(req.pubkey.as_deref())?,
         image_urls: req.image_urls,
         video_urls: req.video_urls,
     };
-    let verdict = check_or_enqueue(&state, &event).await?;
+    let mut verdict = check_or_enqueue(&state, &event).await?;
+    if wait
+        && verdict.status == VerdictStatus::Unknown
+        && (!event.image_urls.is_empty() || !event.video_urls.is_empty())
+    {
+        verdict = wait_for_event_verdict(&state, &event.event_id, timeout_seconds).await?;
+    }
     Ok(Json(VerdictResponse::from_verdict(event.event_id, &verdict)))
 }
 
-async fn submit(State(state): State<AppState>, Json(req): Json<SubmitRequest>) -> Result<Json<Vec<VerdictResponse>>, ApiError> {
+async fn wait_for_event_verdict(
+    state: &AppState,
+    event_id: &str,
+    timeout_seconds: Option<u64>,
+) -> Result<Verdict, ApiError> {
+    let timeout = Duration::from_secs(
+        timeout_seconds
+            .unwrap_or(DEFAULT_WAIT_TIMEOUT_SECONDS)
+            .clamp(1, MAX_WAIT_TIMEOUT_SECONDS),
+    );
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Some(mut verdict) = state.store.latest_verdict(TargetType::Event, event_id).await? {
+            if verdict.status != VerdictStatus::Unknown {
+                verdict.cache = true;
+                return Ok(verdict);
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Ok(Verdict::unknown(TargetType::Event, event_id.to_string()));
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        sleep(WAIT_POLL_INTERVAL.min(remaining)).await;
+    }
+}
+
+async fn submit(
+    State(state): State<AppState>,
+    Json(req): Json<SubmitRequest>,
+) -> Result<Json<Vec<VerdictResponse>>, ApiError> {
     admin::check_rate_limit(&state, "public:submit", "RATE_LIMIT_CHECKS_PER_MINUTE", 120).await?;
     let raw_event = req.raw_event;
     let event_id = req
@@ -764,6 +818,27 @@ mod tests {
 
         assert!(verdict.cache);
         assert_eq!(verdict.status, crate::types::VerdictStatus::Safe);
+    }
+
+    #[tokio::test]
+    async fn wait_for_event_verdict_returns_when_worker_stores_result() {
+        let state = test_state();
+        let store = state.store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            store
+                .store_verdict(&Verdict::safe(TargetType::Event, "waited-event", "test"))
+                .await
+                .unwrap();
+        });
+
+        let verdict = wait_for_event_verdict(&state, "waited-event", Some(1))
+            .await
+            .unwrap();
+
+        assert!(verdict.cache);
+        assert_eq!(verdict.status, VerdictStatus::Safe);
+        assert_eq!(verdict.confidence, 1.0);
     }
 
     #[test]

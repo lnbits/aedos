@@ -150,6 +150,10 @@ pub struct CheckRequest {
     pub image_urls: Vec<String>,
     #[serde(default)]
     pub video_urls: Vec<String>,
+    #[serde(default)]
+    pub wait: bool,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
