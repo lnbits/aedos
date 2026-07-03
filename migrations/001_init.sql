@@ -1,6 +1,7 @@
 create table if not exists events (
   id text primary key,
   pubkey text,
+  pubkey_verified boolean not null default false,
   kind integer,
   content text not null default '',
   raw jsonb not null,
@@ -10,6 +11,7 @@ create table if not exists events (
 );
 
 create index if not exists events_pubkey_idx on events (pubkey);
+create index if not exists events_verified_pubkey_idx on events (pubkey, pubkey_verified);
 
 create table if not exists images (
   id uuid primary key,

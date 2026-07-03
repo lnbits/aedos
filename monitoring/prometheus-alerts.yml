@@ -1,0 +1,38 @@
+groups:
+  - name: aedos
+    rules:
+      - alert: AedosApiDown
+        expr: up{job="aedos-oracle"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Aedos oracle API is down"
+          description: "Prometheus cannot scrape the Aedos oracle /metrics endpoint."
+
+      - alert: AedosNoRecentAnalysis
+        expr: increase(analysed_images[15m]) == 0 and increase(queued_jobs[15m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Aedos queue may not be draining"
+          description: "Jobs are being queued but analysed_images is not increasing."
+
+      - alert: AedosNoFirehoseOrWsClients
+        expr: connected_clients == 0
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "No Aedos WebSocket clients connected"
+          description: "This is only actionable if relays or clients are expected to stay connected."
+
+      - alert: AedosLabelsNotPublishing
+        expr: increase(published_verdict_events[30m]) > 0 and increase(published_labels[30m]) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Aedos verdicts are not becoming published labels"
+          description: "Event verdicts are being produced, but NIP-32 label publishing has not advanced."

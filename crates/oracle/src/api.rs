@@ -33,10 +33,10 @@ use crate::{
         BatchCheckRequest, BatchEvent, CheckRequest, SubmitRequest, TargetType, Verdict,
         VerdictResponse, VerdictStatus,
     },
-    websocket::ws_handler,
+    websocket::{firehose_ws_handler, ws_handler},
 };
 
-use nostr_sdk::prelude::{PublicKey, ToBech32};
+use nostr_sdk::prelude::{Event, JsonUtil, PublicKey, ToBech32};
 
 const DEFAULT_WAIT_TIMEOUT_SECONDS: u64 = 30;
 const MAX_WAIT_TIMEOUT_SECONDS: u64 = 60;
@@ -64,6 +64,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/npubs/nsfw", get(get_nsfw_authors))
         .route("/v1/npubs/csam", get(get_csam_authors))
         .route("/v1/ws", get(ws_handler))
+        .route("/v1/ws/firehose", get(firehose_ws_handler))
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         .layer(cors_layer(&state.config))
         .layer(TraceLayer::new_for_http())
@@ -96,6 +97,12 @@ async fn require_api_key(
     next: Next,
 ) -> Result<Response, ApiError> {
     if !requires_public_api_key(request.uri().path()) || state.config.api_keys.is_empty() {
+        if request.uri().path() == "/v1/ws/firehose" && state.config.api_keys.is_empty() {
+            return Err(ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                message: "firehose WebSocket requires API_KEYS to be configured".to_string(),
+            });
+        }
         return Ok(next.run(request).await);
     }
 
@@ -360,51 +367,67 @@ pub async fn check_or_enqueue(state: &AppState, event: &BatchEvent) -> Result<Ve
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct AuthorListQuery {
+pub struct AuthorListQuery {
     limit: Option<i64>,
+    min_events: Option<i64>,
 }
 
 #[derive(Debug, serde::Serialize)]
-struct AuthorListResponse {
-    label: String,
-    authors: Vec<AuthorListEntry>,
+pub struct AuthorListResponse {
+    pub label: String,
+    pub min_events: i64,
+    pub authors: Vec<AuthorListEntry>,
 }
 
 #[derive(Debug, serde::Serialize)]
-struct AuthorListEntry {
-    pubkey: String,
-    npub: Option<String>,
-    event_count: i64,
-    last_seen_at: chrono::DateTime<chrono::Utc>,
-    event_ids: Vec<String>,
+pub struct AuthorListEntry {
+    pub pubkey: String,
+    pub npub: Option<String>,
+    pub event_count: i64,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+    pub event_ids: Vec<String>,
 }
 
 async fn get_nsfw_authors(
     State(state): State<AppState>,
     Query(query): Query<AuthorListQuery>,
 ) -> Result<Json<AuthorListResponse>, ApiError> {
-    author_list(&state, "nsfw", &["nsfw", "nudity", "sexual", "sexualised"], query.limit).await
+    author_list_json(&state, "nsfw", &["nsfw", "nudity", "sexual", "sexualised"], query.limit, query.min_events).await
 }
 
 async fn get_csam_authors(
     State(state): State<AppState>,
     Query(query): Query<AuthorListQuery>,
 ) -> Result<Json<AuthorListResponse>, ApiError> {
-    author_list(&state, "csam", &["csam-suspected"], query.limit).await
+    author_list_json(&state, "csam", &["csam-suspected"], query.limit, query.min_events).await
 }
 
-async fn author_list(
+async fn author_list_json(
     state: &AppState,
     label: &str,
     labels: &[&str],
     limit: Option<i64>,
+    min_events: Option<i64>,
 ) -> Result<Json<AuthorListResponse>, ApiError> {
+    Ok(Json(author_list(state, label, labels, limit, min_events).await?))
+}
+
+pub async fn author_list(
+    state: &AppState,
+    label: &str,
+    labels: &[&str],
+    limit: Option<i64>,
+    min_events: Option<i64>,
+) -> Result<AuthorListResponse, ApiError> {
+    let min_events = min_events.unwrap_or(1).clamp(1, 10_000);
     let Some(pool) = state.store.pool() else {
-        return Ok(Json(AuthorListResponse {
+        return Ok(AuthorListResponse {
             label: label.to_string(),
+            min_events,
             authors: Vec::new(),
-        }));
+        });
     };
+    ensure_events_schema(pool).await.map_err(anyhow::Error::from)?;
     let labels = labels.iter().map(|label| label.to_string()).collect::<Vec<_>>();
     let limit = limit.unwrap_or(1000).clamp(1, 10_000);
     let rows = sqlx::query(
@@ -424,13 +447,16 @@ async fn author_list(
         join latest_event_verdicts v on v.event_id = e.id
         where e.pubkey is not null
           and e.pubkey <> ''
+          and e.pubkey_verified = true
           and v.labels ?| $1::text[]
         group by e.pubkey
+        having count(*) >= $2
         order by last_seen_at desc
-        limit $2
+        limit $3
         "#,
     )
     .bind(labels)
+    .bind(min_events)
     .bind(limit)
     .fetch_all(pool)
     .await
@@ -452,10 +478,11 @@ async fn author_list(
         .collect::<std::result::Result<Vec<_>, sqlx::Error>>()
         .map_err(anyhow::Error::from)?;
 
-    Ok(Json(AuthorListResponse {
+    Ok(AuthorListResponse {
         label: label.to_string(),
+        min_events,
         authors,
-    }))
+    })
 }
 
 async fn record_analysis_jobs(
@@ -530,6 +557,16 @@ async fn ensure_analysis_jobs_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+async fn ensure_events_schema(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("alter table if exists events add column if not exists pubkey_verified boolean not null default false")
+        .execute(pool)
+        .await?;
+    sqlx::query("create index if not exists events_verified_pubkey_idx on events (pubkey, pubkey_verified)")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 fn analysis_job_key(event_id: &str, url: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(event_id.as_bytes());
@@ -573,9 +610,13 @@ async fn store_raw_event(
     let Some(pool) = pool else {
         return Ok(());
     };
-    let pubkey = fallback_pubkey
-        .map(ToString::to_string)
+    ensure_events_schema(pool).await.map_err(anyhow::Error::from)?;
+    let verified_pubkey = verified_raw_event_pubkey(event_id, raw_event);
+    let pubkey = verified_pubkey
+        .clone()
+        .or_else(|| fallback_pubkey.map(ToString::to_string))
         .or_else(|| raw_event_pubkey(raw_event).and_then(|pubkey| normalized_pubkey(pubkey).ok()));
+    let pubkey_verified = verified_pubkey.is_some();
     let kind = raw_event.get("kind").and_then(Value::as_i64).map(|kind| kind as i32);
     let content = raw_event.get("content").and_then(Value::as_str).unwrap_or_default();
     let created_at = raw_event
@@ -584,10 +625,15 @@ async fn store_raw_event(
         .unwrap_or_else(|| chrono::Utc::now().timestamp());
     sqlx::query(
         r#"
-        insert into events (id, pubkey, kind, content, raw, created_at)
-        values ($1, $2, $3, $4, $5, $6)
+        insert into events (id, pubkey, pubkey_verified, kind, content, raw, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7)
         on conflict (id) do update set
-          pubkey = coalesce(excluded.pubkey, events.pubkey),
+          pubkey = case
+            when excluded.pubkey_verified then excluded.pubkey
+            when events.pubkey_verified then events.pubkey
+            else coalesce(events.pubkey, excluded.pubkey)
+          end,
+          pubkey_verified = events.pubkey_verified or excluded.pubkey_verified,
           kind = coalesce(excluded.kind, events.kind),
           content = excluded.content,
           raw = excluded.raw,
@@ -596,6 +642,7 @@ async fn store_raw_event(
     )
     .bind(event_id)
     .bind(pubkey.as_deref())
+    .bind(pubkey_verified)
     .bind(kind)
     .bind(content)
     .bind(raw_event)
@@ -610,12 +657,16 @@ async fn store_event_shell(pool: Option<&PgPool>, event_id: &str, pubkey: Option
     let Some(pool) = pool else {
         return Ok(());
     };
+    ensure_events_schema(pool).await.map_err(anyhow::Error::from)?;
     sqlx::query(
         r#"
-        insert into events (id, pubkey, content, raw, created_at)
-        values ($1, $2, '', '{}'::jsonb, extract(epoch from now())::bigint)
+        insert into events (id, pubkey, pubkey_verified, content, raw, created_at)
+        values ($1, $2, false, '', '{}'::jsonb, extract(epoch from now())::bigint)
         on conflict (id) do update set
-          pubkey = coalesce(excluded.pubkey, events.pubkey)
+          pubkey = case
+            when events.pubkey_verified then events.pubkey
+            else coalesce(events.pubkey, excluded.pubkey)
+          end
         "#,
     )
     .bind(event_id)
@@ -781,6 +832,12 @@ fn raw_event_pubkey(raw_event: &Value) -> Option<&str> {
     raw_event.get("pubkey").and_then(Value::as_str)
 }
 
+fn verified_raw_event_pubkey(expected_event_id: &str, raw_event: &Value) -> Option<String> {
+    let event = Event::from_json(serde_json::to_string(raw_event).ok()?).ok()?;
+    event.verify().ok()?;
+    (event.id.to_string() == expected_event_id).then(|| event.pubkey.to_string())
+}
+
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
@@ -832,7 +889,11 @@ impl IntoResponse for ApiError {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use axum::{body::Body, http::Request};
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use nostr_sdk::prelude::{EventBuilder, Keys};
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
@@ -921,6 +982,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn firehose_requires_configured_api_keys() {
+        let response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/ws/firehose")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn api_key_allows_public_request() {
         let response = router(test_state_with_api_key())
             .oneshot(
@@ -936,6 +1013,27 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn author_list_accepts_min_events_filter() {
+        let response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/npubs/nsfw?min_events=2&limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["label"], "nsfw");
+        assert_eq!(value["min_events"], 2);
+        assert_eq!(value["authors"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -1030,6 +1128,33 @@ mod tests {
         });
 
         assert!(text_verdict_from_raw_event("text-event", &raw_event).is_none());
+    }
+
+    #[test]
+    fn verified_raw_event_pubkey_accepts_signed_matching_event() {
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note("hello from aedos")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let raw_event: Value = serde_json::from_str(&event.as_json()).unwrap();
+
+        assert_eq!(
+            verified_raw_event_pubkey(&event.id.to_string(), &raw_event),
+            Some(keys.public_key().to_string())
+        );
+    }
+
+    #[test]
+    fn verified_raw_event_pubkey_rejects_forged_or_mismatched_event() {
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note("hello from aedos")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let mut raw_event: Value = serde_json::from_str(&event.as_json()).unwrap();
+        raw_event["pubkey"] = json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        assert_eq!(verified_raw_event_pubkey(&event.id.to_string(), &raw_event), None);
+        assert_eq!(verified_raw_event_pubkey("not-the-real-event-id", &serde_json::from_str(&event.as_json()).unwrap()), None);
     }
 
     #[tokio::test]

@@ -464,10 +464,10 @@
   }
 
   function openAiStatusBody() {
-    if (openAiReady) return 'Recheck with AI will use OpenAI moderation for new image reviews.';
-    if (moderationProvider === 'openai') return 'Add OPENAI_API_KEY, save settings, then recheck the image.';
-    if (hasOpenAiKey) return 'Change MODERATION_PROVIDER from deterministic to openai, save settings, then recheck the image.';
-    return 'Add OPENAI_API_KEY, set MODERATION_PROVIDER to openai, save settings, then recheck the image.';
+    if (openAiReady) return 'Recheck with AI will use OpenAI moderation for new media reviews.';
+    if (moderationProvider === 'openai') return 'Add OPENAI_API_KEY, save settings, then recheck the media item.';
+    if (hasOpenAiKey) return 'Change MODERATION_PROVIDER from deterministic to openai, save settings, then recheck the media item.';
+    return 'Add OPENAI_API_KEY, set MODERATION_PROVIDER to openai, save settings, then recheck the media item.';
   }
 
   function providerResponseText(value: unknown | null) {
@@ -517,7 +517,7 @@
       <div class="brand"><img src={brandLogo} alt="" />AEDOS</div>
       <nav>
         <button class:active={activeView === 'dashboard'} onclick={() => (activeView = 'dashboard')}>Overview</button>
-        <button class:active={activeView === 'images'} onclick={() => (activeView = 'images')}>Images</button>
+        <button class:active={activeView === 'images'} onclick={() => (activeView = 'images')}>Media</button>
         <button class:active={activeView === 'settings'} onclick={() => (activeView = 'settings')}>Settings</button>
       </nav>
       <button class="theme-toggle" type="button" onclick={toggleTheme}>{theme === 'light' ? 'Dark' : 'Light'}</button>
@@ -526,7 +526,7 @@
 
     <aside class="sidebar">
       <button class:active={activeView === 'dashboard'} onclick={() => (activeView = 'dashboard')}>⌂<span>Overview</span></button>
-      <button class:active={activeView === 'images'} onclick={() => (activeView = 'images')}>▦<span>Images</span></button>
+      <button class:active={activeView === 'images'} onclick={() => (activeView = 'images')}>▦<span>Media</span></button>
       <button class:active={activeView === 'settings'} onclick={() => (activeView = 'settings')}>⚙<span>Settings</span></button>
     </aside>
 
@@ -603,7 +603,7 @@
           <div>
             <p class="eyebrow">Reviewed Media</p>
             <div class="title-row">
-              <h1>Images</h1>
+              <h1>Media</h1>
               <span class={`live-indicator ${mediaStreamStatus}`}>
                 <span></span>
                 {mediaStreamStatus === 'live' ? 'Live' : mediaStreamStatus === 'connecting' ? 'Connecting' : 'Reconnecting'}
@@ -620,7 +620,7 @@
           <table>
             <thead>
               <tr>
-                <th>Image</th>
+                <th>Media</th>
                 <th>Events</th>
                 <th>Status</th>
                 <th>Source</th>
@@ -662,12 +662,12 @@
                 </tr>
               {/each}
               {#if images.items.length === 0}
-                <tr><td colspan="6" class="empty">No images yet</td></tr>
+                <tr><td colspan="6" class="empty">No media yet</td></tr>
               {/if}
             </tbody>
           </table>
           <footer class="pager">
-            <span>{images.total} images</span>
+            <span>{images.total} media items</span>
             <select bind:value={perPage} onchange={() => { page = 1; void loadImages(); }}>
               <option value={10}>10</option>
               <option value={25}>25</option>
@@ -701,7 +701,7 @@
                     <option value="deterministic">Local test model</option>
                     <option value="openai">OpenAI moderation</option>
                   </select>
-                  <small>Choose OpenAI moderation here, then save settings before rechecking images.</small>
+                  <small>Choose OpenAI moderation here, then save settings before rechecking media.</small>
                 </label>
               {/if}
             {/each}

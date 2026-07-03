@@ -13,7 +13,7 @@ use sqlx::postgres::PgListener;
 use tokio::sync::mpsc;
 
 use crate::{
-    api::{check_or_enqueue, AppState},
+    api::{author_list, check_or_enqueue, AppState},
     types::{BatchEvent, TargetType, Verdict, VerdictResponse, VerdictStatus},
 };
 
@@ -39,6 +39,19 @@ enum ClientMessage {
     Subscribe { event_ids: Vec<String> },
     #[serde(rename = "unsubscribe")]
     Unsubscribe { event_ids: Vec<String> },
+    #[serde(rename = "author_list")]
+    AuthorList {
+        list: AuthorListKind,
+        limit: Option<i64>,
+        min_events: Option<i64>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AuthorListKind {
+    Nsfw,
+    Csam,
 }
 
 struct WsResponse {
@@ -49,6 +62,10 @@ struct WsResponse {
 
 pub async fn ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(state, socket))
+}
+
+pub async fn firehose_ws_handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_firehose_socket(state, socket))
 }
 
 async fn handle_socket(state: AppState, socket: WebSocket) {
@@ -87,6 +104,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                     }
                     Ok(ClientMessage::CheckBatch { events }) => respond_to_events(&state, events).await,
                     Ok(ClientMessage::Subscribe { event_ids }) => subscribe_to_events(&state, event_ids).await,
+                    Ok(ClientMessage::AuthorList { list, limit, min_events }) => author_list_response(&state, list, limit, min_events).await,
                     Ok(ClientMessage::Unsubscribe { event_ids }) => {
                         for event_id in event_ids {
                             watched_event_ids.remove(&event_id);
@@ -147,6 +165,116 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
     }
 
     state.metrics.connected_clients.fetch_sub(1, Ordering::Relaxed);
+}
+
+async fn handle_firehose_socket(state: AppState, socket: WebSocket) {
+    state.metrics.connected_clients.fetch_add(1, Ordering::Relaxed);
+    let (mut sender, mut receiver) = socket.split();
+    let mut verdict_notifications = spawn_verdict_listener(&state);
+    let mut local_verdicts = state.queue.subscribe_verdicts();
+
+    let _ = sender
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "firehose_ready",
+                "scope": "event_verdicts"
+            })
+            .to_string(),
+        ))
+        .await;
+
+    loop {
+        tokio::select! {
+            maybe_message = receiver.next() => {
+                let Some(Ok(message)) = maybe_message else {
+                    break;
+                };
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+            maybe_event_id = verdict_notifications.recv() => {
+                let Some(event_id) = maybe_event_id else {
+                    continue;
+                };
+                if send_firehose_event(&state, &mut sender, &event_id).await.is_err() {
+                    break;
+                }
+            }
+            maybe_verdict = local_verdicts.recv() => {
+                let Ok(verdict) = maybe_verdict else {
+                    continue;
+                };
+                if verdict.target_type == TargetType::Event && verdict.status != VerdictStatus::Unknown {
+                    let value = firehose_verdict_value(&verdict);
+                    if sender.send(Message::Text(value.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    state.metrics.connected_clients.fetch_sub(1, Ordering::Relaxed);
+}
+
+async fn send_firehose_event(
+    state: &AppState,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    event_id: &str,
+) -> Result<(), ()> {
+    let verdict = state
+        .store
+        .latest_verdict(TargetType::Event, event_id)
+        .await
+        .ok()
+        .flatten()
+        .filter(|verdict| verdict.status != VerdictStatus::Unknown);
+    let Some(verdict) = verdict else {
+        return Ok(());
+    };
+    sender
+        .send(Message::Text(firehose_verdict_value(&verdict).to_string()))
+        .await
+        .map_err(|_| ())
+}
+
+fn firehose_verdict_value(verdict: &Verdict) -> serde_json::Value {
+    serde_json::json!({
+        "type": "firehose_verdict",
+        "target_type": verdict.target_type,
+        "target_id": verdict.target_id,
+        "verdict": VerdictResponse::from_verdict(verdict.target_id.clone(), verdict),
+    })
+}
+
+async fn author_list_response(
+    state: &AppState,
+    list: AuthorListKind,
+    limit: Option<i64>,
+    min_events: Option<i64>,
+) -> Vec<WsResponse> {
+    let (name, labels) = match list {
+        AuthorListKind::Nsfw => ("nsfw", &["nsfw", "nudity", "sexual", "sexualised"][..]),
+        AuthorListKind::Csam => ("csam", &["csam-suspected"][..]),
+    };
+    match author_list(state, name, labels, limit, min_events).await {
+        Ok(response) => vec![WsResponse {
+            event_id: String::new(),
+            value: serde_json::json!({
+                "type": "author_list",
+                "list": response.label,
+                "min_events": response.min_events,
+                "authors": response.authors,
+            }),
+            watch: false,
+        }],
+        Err(err) => vec![WsResponse {
+            event_id: String::new(),
+            value: serde_json::json!({ "type": "error", "error": err.to_string() }),
+            watch: false,
+        }],
+    }
 }
 
 fn spawn_verdict_listener(state: &AppState) -> mpsc::Receiver<String> {

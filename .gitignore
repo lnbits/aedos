@@ -11,6 +11,8 @@ node_modules/
 build/
 apps/dashboard/.env
 
+backups/
+
 __pycache__/
 *.py[cod]
 .pytest_cache/

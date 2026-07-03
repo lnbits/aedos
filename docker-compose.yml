@@ -3,10 +3,10 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: oracle
-      POSTGRES_PASSWORD: oracle
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oracle}
       POSTGRES_DB: oracle
     ports:
-      - "5432:5432"
+      - "${PUBLISHED_BIND_HOST:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
@@ -19,7 +19,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "${PUBLISHED_BIND_HOST:-127.0.0.1}:${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -30,13 +30,15 @@ services:
     build:
       context: .
       dockerfile: crates/oracle/Dockerfile
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     environment:
-      DATABASE_URL: postgres://oracle:oracle@postgres:5432/oracle
+      DATABASE_URL: postgres://oracle:${POSTGRES_PASSWORD:-oracle}@postgres:5432/oracle
       REDIS_URL: redis://redis:6379/0
       HTTP_BIND: 0.0.0.0:8080
     ports:
-      - "8080:8080"
+      - "${PUBLISHED_BIND_HOST:-127.0.0.1}:${ORACLE_PORT:-8080}:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -46,9 +48,11 @@ services:
   worker:
     build:
       context: workers/python
-    env_file: .env
+    env_file:
+      - path: .env
+        required: false
     environment:
-      DATABASE_URL: postgresql://oracle:oracle@postgres:5432/oracle
+      DATABASE_URL: postgresql://oracle:${POSTGRES_PASSWORD:-oracle}@postgres:5432/oracle
       REDIS_URL: redis://redis:6379/0
     depends_on:
       postgres:
@@ -64,7 +68,7 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
     ports:
-      - "3000:3000"
+      - "${PUBLISHED_BIND_HOST:-127.0.0.1}:${DASHBOARD_PORT:-3000}:3000"
     depends_on:
       - oracle
 

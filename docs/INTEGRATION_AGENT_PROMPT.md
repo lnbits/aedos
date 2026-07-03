@@ -36,6 +36,7 @@ Request shape:
 Notes:
 - event_id is required.
 - npub/pubkey, image_urls, and video_urls are optional extras.
+- Treat npub/pubkey on /v1/check as convenience metadata only. Aedos only counts authors in NSFW/CSAM author lists when the author came from a valid signed raw Nostr event submitted to /v1/submit.
 - Use wait=true when the relay/client needs a final verdict before taking action.
 - timeout_seconds is clamped by Aedos. Treat timeout/unknown as policy-controlled, not as safe.
 
@@ -51,6 +52,11 @@ HTTP response shape:
 
 WebSocket endpoint:
 GET {AEDOS_WS_URL}/v1/ws
+
+Trusted firehose endpoint:
+GET {AEDOS_WS_URL}/v1/ws/firehose
+
+Use the firehose only when the relay/client operator is explicitly trusted to receive all completed event verdicts from this Aedos instance. It requires API_KEYS to be configured on Aedos and a valid key on the connection.
 
 Preferred WebSocket flow:
 1. Open one bounded, long-lived WebSocket connection to Aedos.
@@ -69,10 +75,21 @@ Send a batch:
 Subscribe without queueing new media:
 {"type":"subscribe","event_ids":["<event id>"]}
 
+Fetch repeat-sharing author lists:
+{"type":"author_list","list":"nsfw","min_events":2,"limit":1000}
+{"type":"author_list","list":"csam","min_events":2,"limit":1000}
+
 Expected WebSocket behavior:
 - Aedos returns the current verdict immediately.
 - If the verdict is unknown and media was queued, keep the socket open. Aedos will send a later verdict message when processing finishes.
+- Author-list messages return authors whose stored event verdicts match the requested list and whose pubkey was verified from a signed raw Nostr event. Use min_events to ask for repeated sharing rather than any single match.
 - Reconnect with backoff. Do not create an unbounded reconnect loop.
+
+Firehose behavior:
+- Connect to /v1/ws/firehose only for trusted peers.
+- Expect an initial {"type":"firehose_ready","scope":"event_verdicts"} message.
+- Expect {"type":"firehose_verdict",...} for every completed event verdict stored after the connection opens.
+- Do not use the firehose for untrusted public clients; use scoped /v1/ws checks instead.
 
 Relay integration behavior:
 1. On EVENT received, extract:
@@ -100,7 +117,7 @@ Relay integration behavior:
    - Record enough logs to debug Aedos failures without logging sensitive media payloads.
 
 Client integration behavior:
-1. For notes in timelines, extract event id, pubkey, image URLs, and direct video URLs.
+1. For notes in timelines, extract event id, pubkey, image URLs, and direct video URLs. When possible, submit the full signed raw event to Aedos so author attribution can be verified.
 2. Prefer existing NIP-32 labels from trusted Aedos label pubkeys when available.
 3. If no trusted label exists, query Aedos using WebSockets for timeline/live updates. Use HTTP for simple fallback checks.
 4. Apply display policy:

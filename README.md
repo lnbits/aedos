@@ -13,7 +13,7 @@ Nostr gives users, clients, and relays freedom, but it also means every app is l
 - Supports OpenAI image moderation with `MODERATION_PROVIDER=openai`.
 - Samples video frames with `ffmpeg` and reviews those frames through the configured image moderation provider.
 - Detects high-risk text tags such as `#csam`, `#pedo`, and `#loli`, plus NSFW tags such as `#nsfw`, `#porn`, and `#nudity`.
-- Stores author/pubkey links so Aedos can expose NSFW and CSAM-suspected author lists.
+- Stores verified author/pubkey links from signed Nostr events so Aedos can expose NSFW and CSAM-suspected author lists without trusting caller-supplied authors.
 - Stores compact provider response details for audit/debugging, not full media bytes.
 - Provides a SvelteKit admin dashboard with login, stats, media review, recheck actions, settings, theme toggle, relay status, and job error visibility.
 - Generates NIP-32 label drafts using kind `1985`.
@@ -29,17 +29,36 @@ Nostr gives users, clients, and relays freedom, but it also means every app is l
 
 ## Quick Start
 
-Copy the example environment file:
-
-```bash
-cp .env.example .env
-```
-
 Start the stack:
 
 ```bash
 docker compose up --build
 ```
+
+No `.env` file is required for first launch. By default, Compose uses local-only published ports and a development Postgres password inside the Docker network.
+
+To customize before launch, copy the example environment file:
+
+```bash
+cp .env.example .env
+```
+
+Published ports can be changed in `.env`:
+
+```env
+DASHBOARD_PORT=3001
+ORACLE_PORT=8081
+POSTGRES_PORT=5433
+REDIS_PORT=6380
+```
+
+Or for a one-off run:
+
+```bash
+DASHBOARD_PORT=3001 ORACLE_PORT=8081 docker compose up --build
+```
+
+Most Aedos settings can also be changed later from the dashboard UI after you create the first admin account.
 
 This starts:
 
@@ -95,7 +114,7 @@ curl -X POST http://localhost:8080/v1/check \
   }'
 ```
 
-`event_id` is required. `npub`/`pubkey`, `image_urls`, and `video_urls` are optional.
+`event_id` is required. `npub`/`pubkey`, `image_urls`, and `video_urls` are optional. The optional `npub`/`pubkey` on `/v1/check` is treated as unverified metadata; it is not enough to put an author on an Aedos author list.
 
 By default, `/v1/check` queues new media and returns immediately. The first response may be `unknown` while the worker downloads and reviews the media:
 
@@ -127,7 +146,7 @@ curl -X POST http://localhost:8080/v1/check \
 
 `timeout_seconds` defaults to `30` and is clamped between `1` and `60`. If the timeout is reached before processing finishes, Aedos still returns `unknown`; a later check will return the cached verdict.
 
-`POST /v1/submit` accepts a raw Nostr event. Aedos stores the event, extracts image/video URLs from the content, records the author, and checks text tags.
+`POST /v1/submit` accepts a raw Nostr event. Aedos stores the event, verifies the event signature before attributing the author, extracts image/video URLs from the content, and checks text tags.
 
 ```bash
 curl -X POST http://localhost:8080/v1/submit \
@@ -307,6 +326,8 @@ Boot-level settings still require restarting the relevant service after editing 
 Before exposing Aedos outside a trusted network:
 
 - Set `API_KEYS` to one or more long random keys.
+- Set `POSTGRES_PASSWORD` to a long random password before first production boot. If you already started with the default password, recreate the Postgres volume after changing it.
+- Keep `PUBLISHED_BIND_HOST=127.0.0.1` and put public access behind a reverse proxy, SSH tunnel, or firewall rule. Do not expose Postgres or Redis to the public internet.
 - Set `ALLOWED_ORIGINS` to the dashboard/client origins that should use the API from browsers.
 - Put Aedos behind HTTPS and set `SECURE_COOKIES=true`.
 - Set `NOSTR_PRIVATE_KEY` to the signing key for your oracle.
@@ -324,9 +345,16 @@ GET /v1/npubs/nsfw
 GET /v1/npubs/csam
 ```
 
-Responses include hex pubkeys, bech32 `npub` values when valid, event counts, recent event IDs, and the latest matching time.
+Add `?min_events=2` to return only authors with repeated matching events:
 
-These lists are derived from stored verdicts and event/pubkey links. They are not external blocklists.
+```text
+GET /v1/npubs/nsfw?min_events=2
+GET /v1/npubs/csam?min_events=2
+```
+
+Responses include the active `min_events` filter, hex pubkeys, bech32 `npub` values when valid, event counts, recent event IDs, and the latest matching time.
+
+These lists are derived from stored verdicts and verified signed event/pubkey links. Caller-supplied `npub` values from `/v1/check` are intentionally ignored for author-list membership, because otherwise a malicious client could attach an innocent author to bad media. They are not external blocklists.
 
 ## Queue Reliability
 
@@ -339,6 +367,17 @@ Analysis jobs are stored in Redis:
 Workers acknowledge jobs only after successful processing. Failed jobs are retried with exponential backoff and then moved to the dead-letter stream after the retry limit is reached. Stream sizes are capped with Redis `MAXLEN` settings so busy deployments do not grow without bounds.
 
 The dashboard also stores per-media job state in Postgres so operators can see whether a media item is queued, processing, retrying, completed, or failed.
+
+## Operations
+
+Backup, retention, migration, monitoring, alerting, and recovery procedures are defined in [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+Included helpers:
+
+- `scripts/backup-postgres.sh`
+- `scripts/restore-postgres.sh`
+- `scripts/retention.sql`
+- `monitoring/prometheus-alerts.yml`
 
 ## Data Storage
 
@@ -366,6 +405,7 @@ Public API:
 - `GET /v1/npubs/nsfw`
 - `GET /v1/npubs/csam`
 - `GET /v1/ws`
+- `GET /v1/ws/firehose`
 - `GET /health`
 - `GET /metrics`
 
@@ -409,11 +449,59 @@ Stop watching event IDs:
 {"type":"unsubscribe","event_ids":["event1"]}
 ```
 
+Fetch repeat-sharing author lists over WebSocket:
+
+```json
+{"type":"author_list","list":"nsfw","min_events":2,"limit":1000}
+```
+
+`list` can be `nsfw` or `csam`. `min_events` defaults to `1`.
+
+### Firehose WebSocket
+
+Trusted peers can connect to `/v1/ws/firehose` to receive every completed event verdict as it is stored. This endpoint requires `API_KEYS` to be configured and the caller must provide a key with `x-api-key`, `Authorization: Bearer ...`, or `?api_key=...`.
+
+```text
+ws://localhost:8080/v1/ws/firehose?api_key=your-key
+```
+
+On connect, Aedos sends:
+
+```json
+{"type":"firehose_ready","scope":"event_verdicts"}
+```
+
+Then each completed event verdict is sent as:
+
+```json
+{
+  "type": "firehose_verdict",
+  "target_type": "event",
+  "target_id": "event-id",
+  "verdict": {
+    "type": "verdict",
+    "event_id": "event-id",
+    "status": "warn",
+    "cache": true,
+    "labels": ["nsfw"],
+    "confidence": 0.91
+  }
+}
+```
+
+Use the normal `/v1/ws` endpoint for scoped relay/client checks. Use the firehose only for trusted operators or friends who should see all Aedos verdict activity.
+
 ## Environment
 
 See `.env.example` for defaults. Important values:
 
 - `DATABASE_URL`
+- `POSTGRES_PASSWORD`
+- `PUBLISHED_BIND_HOST`
+- `POSTGRES_PORT`
+- `REDIS_PORT`
+- `ORACLE_PORT`
+- `DASHBOARD_PORT`
 - `REDIS_URL`
 - `NOSTR_PRIVATE_KEY`
 - `NOSTR_RELAYS`
