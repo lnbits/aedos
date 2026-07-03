@@ -66,7 +66,7 @@ curl -X POST http://localhost:8080/v1/check \
   -d '{"event_id":"example"}'
 ```
 
-API keys are accepted as `x-api-key`, `Authorization: Bearer ...`, or `?api_key=...` for WebSocket clients.
+API keys are accepted as `x-api-key`, `Authorization: Bearer ...`, or `?api_key=...` for WebSocket clients. Prefer headers when possible; use `?api_key=...` only when a browser WebSocket client cannot set headers, because query strings may be captured by proxy/access logs.
 
 Check the API:
 

@@ -102,7 +102,7 @@ async fn require_api_key(
     let supplied_key = api_key_from_request(&request);
     if supplied_key
         .as_deref()
-        .is_some_and(|key| state.config.api_keys.iter().any(|known| known == key))
+        .is_some_and(|key| state.config.api_keys.iter().any(|known| constant_time_eq(known.as_bytes(), key.as_bytes())))
     {
         Ok(next.run(request).await)
     } else {
@@ -145,6 +145,17 @@ fn query_api_key(query: Option<&str>) -> Option<String> {
         .split('&')
         .filter_map(|pair| pair.split_once('='))
         .find_map(|(key, value)| (key == "api_key" && !value.is_empty()).then(|| value.to_string()))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or_default();
+        let right_byte = right.get(index).copied().unwrap_or_default();
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -925,6 +936,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn constant_time_key_compare_matches_only_equal_bytes() {
+        assert!(constant_time_eq(b"secret-test-key", b"secret-test-key"));
+        assert!(!constant_time_eq(b"secret-test-key", b"secret-test-kex"));
+        assert!(!constant_time_eq(b"secret-test-key", b"secret-test-key-extra"));
+        assert!(!constant_time_eq(b"secret-test-key", b""));
     }
 
     #[tokio::test]

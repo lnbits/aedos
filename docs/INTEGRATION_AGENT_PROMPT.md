@@ -16,7 +16,7 @@ Important Aedos concepts:
 - Prefer the Aedos WebSocket API for active relay/client integrations. It lets the integration submit checks and receive final verdict updates on the same connection.
 - Use HTTP for simple one-off checks, startup probes, server environments where WebSockets are awkward, or fallback behavior.
 - Aedos can return unknown immediately while media is queued. Use WebSockets, or HTTP wait mode, if the integration needs the final verdict before accepting/displaying content.
-- If API_KEYS is configured on Aedos, pass the key as x-api-key, Authorization: Bearer <key>, or ?api_key=<key> for WebSocket connections.
+- If API_KEYS is configured on Aedos, pass the key as x-api-key, Authorization: Bearer <key>, or ?api_key=<key> for WebSocket connections. Prefer headers when possible. Use query-string keys only for browser WebSocket constraints, and assume URLs may be captured by proxy/access logs.
 - Aedos can also publish NIP-32 label events, kind 1985, to configured Nostr relays. Prefer verified NIP-32 labels for clients/relays that already consume Nostr label events.
 
 HTTP endpoint:
