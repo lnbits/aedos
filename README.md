@@ -17,10 +17,11 @@ Nostr gives users, clients, and relays freedom, but it also means every app is l
 - Stores compact provider response details for audit/debugging, not full media bytes.
 - Provides a SvelteKit admin dashboard with login, stats, media review, recheck actions, settings, theme toggle, relay status, and job error visibility.
 - Generates NIP-32 label drafts using kind `1985`.
+- Publishes stored event verdicts as NIP-32 labels when `NOSTR_PRIVATE_KEY`, `NOSTR_RELAYS`, and `ENABLE_LABEL_PUBLISHER=true` are configured.
 
 ## Current Limits
 
-- Relay publishing is isolated in `crates/oracle/src/nostr.rs`; the code validates NIP-shaped label drafts, but the live relay publisher is not the strongest part of the system yet.
+- Relay publishing is implemented as a background publisher for stored event verdicts. It still needs real relay soak testing before being treated as relay-scale infrastructure.
 - Video review checks sampled visual frames only. It does not inspect audio, subtitles, or HLS playlists.
 - The text review layer is rule-based and focused on explicit Nostr tags/hashtags.
 - OpenAI OAuth is not used. Aedos currently expects an API key.
@@ -55,6 +56,17 @@ http://localhost:3000
 ```
 
 On first load, create the first admin account. The dashboard stores the password with Argon2 and uses an HttpOnly, SameSite session cookie.
+
+If `API_KEYS` is set, public `/v1/*` and `/metrics` requests must include one of the configured keys:
+
+```bash
+curl -X POST http://localhost:8080/v1/check \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: your-key' \
+  -d '{"event_id":"example"}'
+```
+
+API keys are accepted as `x-api-key`, `Authorization: Bearer ...`, or `?api_key=...` for WebSocket clients.
 
 Check the API:
 
@@ -220,6 +232,8 @@ Target tags:
 - `["r", "<url>"]` for URL verdicts
 - `["x", "<sha256>"]` for image and video hash verdicts
 
+When `ENABLE_LABEL_PUBLISHER=true`, `NOSTR_PRIVATE_KEY` is set, and `NOSTR_RELAYS` contains at least one relay, the Rust API process scans final stored event verdicts and publishes NIP-32 label events in the background. Published label drafts and their Nostr event IDs are recorded in `published_labels` to avoid repeat publishing.
+
 There is also a configurable realtime event draft kind, `ORACLE_VERDICT_KIND`, defaulting to `31494`. That is Aedos-specific and useful for direct integrations, but NIP-32 kind `1985` is the standards-aligned format clients and relays should prefer.
 
 ## Dashboard
@@ -265,6 +279,19 @@ Public API rate limiting is controlled by:
 - `RATE_LIMIT_CHECKS_PER_MINUTE`
 
 Boot-level settings still require restarting the relevant service after editing `.env`, such as database URLs, Redis URLs, bind ports, and Compose port mappings.
+
+## Production Hardening
+
+Before exposing Aedos outside a trusted network:
+
+- Set `API_KEYS` to one or more long random keys.
+- Set `ALLOWED_ORIGINS` to the dashboard/client origins that should use the API from browsers.
+- Put Aedos behind HTTPS and set `SECURE_COOKIES=true`.
+- Set `NOSTR_PRIVATE_KEY` to the signing key for your oracle.
+- Set `NOSTR_RELAYS` to the relays where labels should be published.
+- Keep `ENABLE_LABEL_PUBLISHER=true` if you want stored event verdicts published as NIP-32 labels.
+- Run all test suites before deploying changes.
+- Put Postgres and Redis on private networking with real credentials.
 
 ## Author Lists
 
@@ -346,7 +373,7 @@ WebSocket batch check:
 {"type":"check_batch","events":[{"event_id":"...","npub":"npub1...","image_urls":[],"video_urls":[]}]}
 ```
 
-The WebSocket returns the current verdict immediately. If that verdict is `unknown` and the request queued media for review, the connection stays subscribed to that event ID and sends another `verdict` message when the worker stores the final result.
+The WebSocket returns the current verdict immediately. If that verdict is `unknown` and the request queued media for review, the connection stays subscribed to that event ID and sends another `verdict` message when the worker stores the final result. With Postgres enabled, worker/API verdict writes notify connected WebSockets through `LISTEN/NOTIFY`; a short polling loop remains as a fallback.
 
 You can also subscribe to existing event IDs without queueing new media:
 
@@ -368,7 +395,11 @@ See `.env.example` for defaults. Important values:
 - `REDIS_URL`
 - `NOSTR_PRIVATE_KEY`
 - `NOSTR_RELAYS`
+- `ALLOWED_ORIGINS`
+- `SECURE_COOKIES`
 - `LABEL_NAMESPACE`
+- `ENABLE_LABEL_PUBLISHER`
+- `LABEL_PUBLISH_INTERVAL_SECONDS`
 - `ORACLE_VERDICT_KIND`
 - `MAX_IMAGE_BYTES`
 - `MAX_VIDEO_BYTES`
@@ -388,7 +419,7 @@ See `.env.example` for defaults. Important values:
 
 `NOSTR_PRIVATE_KEY` is for signing moderation label events so clients and relays can verify that labels came from your Aedos instance.
 
-`NOSTR_RELAYS` are the relays Aedos is configured to use for Nostr label delivery. The dashboard currently uses them to show WebSocket connectivity while the relay publisher remains isolated in the Nostr module.
+`NOSTR_RELAYS` are the relays Aedos is configured to use for Nostr label delivery. The dashboard also uses them to show WebSocket connectivity.
 
 ## Tests
 

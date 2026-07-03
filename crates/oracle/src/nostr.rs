@@ -2,6 +2,12 @@ use serde_json::json;
 
 use crate::{labels::EventDraft, types::Verdict};
 
+#[derive(Debug, Clone)]
+pub struct PublisherConfig {
+    pub private_key: Option<String>,
+    pub relays: Vec<String>,
+}
+
 pub fn build_realtime_verdict_event(kind: u64, verdict: &Verdict, sha256: Option<&str>) -> EventDraft {
     let mut tags = vec![
         vec!["d".to_string(), format!("{}:{}", verdict.target_type.as_str(), verdict.target_id)],
@@ -25,12 +31,39 @@ pub fn build_realtime_verdict_event(kind: u64, verdict: &Verdict, sha256: Option
     }
 }
 
-pub async fn publish_draft(_draft: &EventDraft) -> anyhow::Result<Option<String>> {
-    // The production publisher is intentionally isolated here. It will use nostr-sdk
-    // keys and clients once relay credentials are configured; tests exercise the
-    // NIP-shaped drafts without needing external relays.
-    let _sdk_marker = std::any::type_name::<nostr_sdk::Client>();
-    Ok(None)
+pub async fn publish_draft(draft: &EventDraft, config: &PublisherConfig) -> anyhow::Result<Option<String>> {
+    let Some(private_key) = config.private_key.as_deref().filter(|key| !key.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if config.relays.is_empty() {
+        return Ok(None);
+    }
+
+    let event = signed_event_from_draft(draft, private_key)?;
+    let event_id = event.id.to_string();
+    let keys = nostr_sdk::Keys::parse(private_key)?;
+    let client = nostr_sdk::Client::new(keys);
+    for relay in &config.relays {
+        client.add_relay(relay).await?;
+    }
+    client.connect_with_timeout(std::time::Duration::from_secs(5)).await;
+    let output = client.send_event(event).await?;
+    if output.success.is_empty() {
+        anyhow::bail!("label event was not accepted by any configured relay");
+    }
+    Ok(Some(event_id))
+}
+
+pub fn signed_event_from_draft(draft: &EventDraft, private_key: &str) -> anyhow::Result<nostr_sdk::Event> {
+    let keys = nostr_sdk::Keys::parse(private_key)?;
+    let tags = draft
+        .tags
+        .iter()
+        .map(|tag| nostr_sdk::Tag::parse(tag.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(nostr_sdk::EventBuilder::new(nostr_sdk::Kind::from_u16(draft.kind as u16), draft.content.clone())
+        .tags(tags)
+        .sign_with_keys(&keys)?)
 }
 
 fn target_tag_name(target_type: &str) -> &'static str {
@@ -64,9 +97,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publisher_stub_is_callable_without_relays() {
+    async fn publisher_is_noop_without_relay_config() {
         let verdict = Verdict::safe(TargetType::Event, "f".repeat(64), "test");
         let draft = build_realtime_verdict_event(31494, &verdict, None);
-        assert!(publish_draft(&draft).await.unwrap().is_none());
+        assert!(publish_draft(
+            &draft,
+            &PublisherConfig {
+                private_key: None,
+                relays: vec![]
+            }
+        )
+        .await
+        .unwrap()
+        .is_none());
     }
 }

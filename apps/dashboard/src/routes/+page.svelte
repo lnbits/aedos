@@ -65,6 +65,7 @@
   };
 
   type Theme = 'light' | 'dark';
+  type StreamStatus = 'connecting' | 'live' | 'offline';
 
   const themeStorageKey = 'aedos-theme';
 
@@ -125,7 +126,9 @@
   let recheckNotice = $state('');
   let toasts = $state<Toast[]>([]);
   let theme = $state<Theme>('light');
+  let mediaStreamStatus = $state<StreamStatus>('offline');
   let nextToastId = 1;
+  let mediaRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   const totalPages = $derived(Math.max(1, Math.ceil(images.total / images.per_page)));
   const processedStates = $derived(
@@ -151,6 +154,49 @@
       });
     }, 2500);
     return () => clearInterval(interval);
+  });
+
+  $effect(() => {
+    if (!session.authenticated) {
+      mediaStreamStatus = 'offline';
+      return;
+    }
+    if (typeof window === 'undefined') return;
+
+    let closed = false;
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = () => {
+      mediaStreamStatus = 'connecting';
+      socket = new WebSocket(adminStreamUrl());
+      socket.onopen = () => {
+        mediaStreamStatus = 'live';
+      };
+      socket.onmessage = (event) => {
+        const message = parseStreamMessage(event.data);
+        if (message?.type === 'media_changed') {
+          scheduleMediaRefresh();
+        }
+      };
+      socket.onerror = () => {
+        socket?.close();
+      };
+      socket.onclose = () => {
+        if (closed) return;
+        mediaStreamStatus = 'offline';
+        reconnectTimer = setTimeout(connect, 3000);
+      };
+    };
+
+    connect();
+
+    return () => {
+      closed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      socket?.close();
+      mediaStreamStatus = 'offline';
+    };
   });
 
   function loadTheme() {
@@ -225,6 +271,34 @@
       per_page: String(perPage)
     });
     images = await api<ImagesResponse>(`/admin/api/images?${params}`);
+  }
+
+  function scheduleMediaRefresh() {
+    if (mediaRefreshTimer) clearTimeout(mediaRefreshTimer);
+    mediaRefreshTimer = setTimeout(() => {
+      mediaRefreshTimer = null;
+      void Promise.all([loadOverview(), loadImages()]).then(() => {
+        if (selected) refreshSelectedFromImages(selected);
+      });
+    }, 200);
+  }
+
+  function adminStreamUrl() {
+    const url = new URL('/admin/api/stream', window.location.href);
+    url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    if (url.port === '3000') {
+      url.port = '8080';
+    }
+    return url.toString();
+  }
+
+  function parseStreamMessage(data: unknown): { type?: string } | null {
+    if (typeof data !== 'string') return null;
+    try {
+      return JSON.parse(data);
+    } catch {
+      return null;
+    }
   }
 
   async function loadSettings() {
@@ -528,7 +602,13 @@
         <div class="page-head">
           <div>
             <p class="eyebrow">Reviewed Media</p>
-            <h1>Images</h1>
+            <div class="title-row">
+              <h1>Images</h1>
+              <span class={`live-indicator ${mediaStreamStatus}`}>
+                <span></span>
+                {mediaStreamStatus === 'live' ? 'Live' : mediaStreamStatus === 'connecting' ? 'Connecting' : 'Reconnecting'}
+              </span>
+            </div>
           </div>
           <form class="search" onsubmit={(event) => { event.preventDefault(); void runSearch(); }}>
             <input bind:value={search} placeholder="Search event id, SHA-256, or URL" />
@@ -970,6 +1050,49 @@
   .eyebrow, .muted {
     color: var(--muted);
     font-size: 12px;
+  }
+
+  .title-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+
+  .live-indicator {
+    min-height: 24px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+  }
+
+  .live-indicator span {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: #a33f3f;
+    box-shadow: 0 0 0 3px color-mix(in srgb, #a33f3f 18%, transparent);
+  }
+
+  .live-indicator.live {
+    color: #21c566;
+  }
+
+  .live-indicator.live span {
+    background: #21c566;
+    box-shadow: 0 0 0 3px color-mix(in srgb, #21c566 18%, transparent);
+  }
+
+  .live-indicator.connecting span {
+    background: #c49a25;
+    box-shadow: 0 0 0 3px color-mix(in srgb, #c49a25 18%, transparent);
   }
 
   .stats-grid {

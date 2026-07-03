@@ -9,7 +9,10 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::{Path, Query, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -20,17 +23,22 @@ use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row};
+use sqlx::{postgres::PgListener, PgPool, Row};
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
 use uuid::Uuid;
 
-use crate::{api::AppState, db::status_str, types::{TargetType, Verdict, VerdictStatus}};
-use crate::queue::{AnalysisJob, DEFAULT_STREAM_MAXLEN};
+use crate::{
+    api::AppState,
+    db::status_str,
+    queue::{AnalysisJob, DEFAULT_STREAM_MAXLEN},
+    types::{TargetType, Verdict, VerdictStatus},
+};
 
 const SESSION_COOKIE: &str = "aedos_session";
 const SESSION_TTL_SECONDS: i64 = 60 * 60 * 24 * 7;
 const SECRET_MASK: &str = "********";
+const ADMIN_MEDIA_CHANNEL: &str = "aedos_media";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -39,6 +47,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/api/logout", post(logout))
         .route("/admin/api/session", get(session))
         .route("/admin/api/overview", get(overview))
+        .route("/admin/api/stream", get(media_stream))
         .route("/admin/api/images", get(images))
         .route("/admin/api/images/:sha256/verdict", post(change_image_verdict))
         .route("/admin/api/images/:sha256/recheck", post(recheck_image))
@@ -447,6 +456,49 @@ async fn images(
     Ok(Json(ImagesResponse { items, total, page, per_page }))
 }
 
+async fn media_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<impl IntoResponse, AdminError> {
+    let pool = authed_pool(&state, &headers).await?.clone();
+    Ok(ws.on_upgrade(move |socket| handle_media_stream(pool, socket)))
+}
+
+async fn handle_media_stream(pool: PgPool, mut socket: WebSocket) {
+    let Ok(mut listener) = PgListener::connect_with(&pool).await else {
+        let _ = socket
+            .send(Message::Text(json!({ "type": "error", "error": "could not connect to media event stream" }).to_string()))
+            .await;
+        return;
+    };
+
+    if listener.listen(ADMIN_MEDIA_CHANNEL).await.is_err() {
+        let _ = socket
+            .send(Message::Text(json!({ "type": "error", "error": "could not subscribe to media event stream" }).to_string()))
+            .await;
+        return;
+    }
+
+    if socket
+        .send(Message::Text(json!({ "type": "connected" }).to_string()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    while let Ok(notification) = listener.recv().await {
+        let message = json!({
+            "type": "media_changed",
+            "target": notification.payload(),
+        });
+        if socket.send(Message::Text(message.to_string())).await.is_err() {
+            break;
+        }
+    }
+}
+
 async fn change_image_verdict(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -504,6 +556,7 @@ async fn change_media_verdict(
     .bind(&verdict.explanation)
     .execute(pool)
     .await?;
+    notify_media_changed(pool, &verdict.target_id).await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -547,7 +600,7 @@ async fn recheck_image(
                 pubkey: None,
                 image_urls: vec![url],
                 video_urls: vec![],
-                image_sha256: Some(sha256),
+                image_sha256: Some(sha256.clone()),
                 force_recheck: true,
                 image_only: true,
             },
@@ -555,6 +608,7 @@ async fn recheck_image(
         )
         .await
         .map_err(anyhow::Error::from)?;
+    notify_media_changed(pool, &sha256).await?;
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -613,6 +667,7 @@ async fn recheck_video(
         )
         .await
         .map_err(anyhow::Error::from)?;
+    notify_media_changed(pool, &sha256).await?;
 
     Ok(Json(json!({ "ok": true })))
 }
@@ -699,6 +754,15 @@ async fn authed_pool<'a>(state: &'a AppState, headers: &HeaderMap) -> Result<&'a
         return Err(AdminError::unauthorized());
     }
     Ok(pool)
+}
+
+async fn notify_media_changed(pool: &PgPool, target: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("select pg_notify($1, $2)")
+        .bind(ADMIN_MEDIA_CHANNEL)
+        .bind(target)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 async fn ensure_admin_schema(pool: &PgPool) -> Result<()> {
@@ -864,18 +928,27 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
 }
 
 fn set_session_cookie(headers: &mut HeaderMap, token: &str) -> Result<(), AdminError> {
+    let secure = if secure_cookies_enabled() { "; Secure" } else { "" };
     let cookie = format!(
-        "{SESSION_COOKIE}={token}; Max-Age={SESSION_TTL_SECONDS}; Path=/; HttpOnly; SameSite=Strict"
+        "{SESSION_COOKIE}={token}; Max-Age={SESSION_TTL_SECONDS}; Path=/; HttpOnly; SameSite=Strict{secure}"
     );
     headers.insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).map_err(|err| AdminError::bad_request(err.to_string()))?);
     Ok(())
 }
 
 fn clear_cookie(headers: &mut HeaderMap) {
-    headers.insert(
-        header::SET_COOKIE,
-        HeaderValue::from_static("aedos_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict"),
-    );
+    let secure = if secure_cookies_enabled() { "; Secure" } else { "" };
+    let cookie = format!("aedos_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict{secure}");
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        headers.insert(header::SET_COOKIE, value);
+    }
+}
+
+fn secure_cookies_enabled() -> bool {
+    std::env::var("SECURE_COOKIES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(false)
 }
 
 async fn queue_counts(state: &AppState) -> (i64, i64, i64) {

@@ -6,7 +6,10 @@ use serde_json::json;
 use sqlx::{PgPool, Row};
 use tokio::sync::RwLock;
 
-use crate::types::{TargetType, Verdict, VerdictStatus};
+use crate::{
+    labels::EventDraft,
+    types::{TargetType, Verdict, VerdictStatus},
+};
 
 #[derive(Clone)]
 pub struct Store {
@@ -126,10 +129,104 @@ impl Store {
             .bind(Utc::now())
             .execute(pool)
             .await?;
+            if verdict.target_type == TargetType::Event && verdict.status != VerdictStatus::Unknown {
+                sqlx::query("select pg_notify('aedos_verdicts', $1)")
+                    .bind(&verdict.target_id)
+                    .execute(pool)
+                    .await?;
+            }
+            if matches!(verdict.target_type, TargetType::Image | TargetType::Video) {
+                sqlx::query("select pg_notify('aedos_media', $1)")
+                    .bind(&verdict.target_id)
+                    .execute(pool)
+                    .await?;
+            }
         }
 
         let key = (verdict.target_type.as_str().to_string(), verdict.target_id.clone());
         self.memory.write().await.insert(key, verdict.clone());
+        Ok(())
+    }
+
+    pub async fn unpublished_event_verdicts(&self, limit: i64) -> Result<Vec<Verdict>> {
+        let Some(pool) = &self.pool else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query(
+            r#"
+            with latest as (
+              select distinct on (target_type, target_id)
+                     id, target_type, target_id, status, safe, warn, block, unknown, error,
+                     labels, confidence, source, cache, model_version, explanation, created_at
+              from verdicts
+              where target_type = 'event' and status <> 'unknown'
+              order by target_type, target_id, created_at desc
+            )
+            select id, target_id, status, safe, warn, block, unknown, error,
+                   labels, confidence, source, cache, model_version, explanation
+            from latest
+            where not exists (
+              select 1
+              from published_labels p
+              where p.target_type = latest.target_type
+                and p.target_id = latest.target_id
+            )
+            order by created_at asc
+            limit $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let labels: serde_json::Value = row.try_get("labels")?;
+                let labels = serde_json::from_value(labels).unwrap_or_default();
+                Ok(Verdict {
+                    id: row.try_get("id")?,
+                    target_type: TargetType::Event,
+                    target_id: row.try_get("target_id")?,
+                    status: parse_status(row.try_get::<String, _>("status")?.as_str()),
+                    safe: row.try_get("safe")?,
+                    warn: row.try_get("warn")?,
+                    block: row.try_get("block")?,
+                    unknown: row.try_get("unknown")?,
+                    error: row.try_get("error")?,
+                    labels,
+                    confidence: row.try_get("confidence")?,
+                    source: row.try_get("source")?,
+                    cache: row.try_get("cache")?,
+                    model_version: row.try_get("model_version")?,
+                    explanation: row.try_get("explanation")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn store_published_label(
+        &self,
+        target_type: TargetType,
+        target_id: &str,
+        nostr_event_id: Option<&str>,
+        label_event: &EventDraft,
+    ) -> Result<()> {
+        let Some(pool) = &self.pool else {
+            return Ok(());
+        };
+        sqlx::query(
+            r#"
+            insert into published_labels (id, target_type, target_id, nostr_event_id, label_event)
+            values ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(target_type.as_str())
+        .bind(target_id)
+        .bind(nostr_event_id)
+        .bind(json!(label_event))
+        .execute(pool)
+        .await?;
         Ok(())
     }
 }

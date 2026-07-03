@@ -27,6 +27,7 @@ from worker import (
     provider_signature,
     retry_or_dead_letter,
     store_emergency_escalation,
+    update_analysis_job,
 )
 
 
@@ -119,6 +120,27 @@ def png_bytes() -> bytes:
 
 def test_error_message_falls_back_to_exception_type_for_blank_errors() -> None:
     assert error_message(TimeoutError()) == "TimeoutError"
+
+
+async def test_update_analysis_job_inserts_last_error_value() -> None:
+    conn = RecordingConnection()
+
+    await update_analysis_job(
+        conn,
+        event_id="event123",
+        url="https://example.com/a.mp4",
+        media_type="video",
+        image_sha256="abc123",
+        status="failed",
+        error="decode failed",
+    )
+
+    query, args = conn.calls[0]
+    assert "insert into analysis_jobs" in query
+    assert "$7" in query
+    assert len(args) == 7
+    assert args[4:] == ("abc123", "failed", "decode failed")
+    assert conn.calls[1] == ("select pg_notify('aedos_media', $1)", ("abc123",))
 
 
 async def test_store_emergency_escalation_records_metadata_only() -> None:

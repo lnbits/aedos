@@ -263,6 +263,7 @@ async def update_image_job(
         status,
         error_text,
     )
+    await conn.execute("select pg_notify('aedos_media', $1)", sha256)
 
 
 def analysis_job_key(event_id: str, url: str) -> str:
@@ -291,6 +292,7 @@ async def update_analysis_job(
           $4,
           $5,
           $6,
+          $7,
           now(),
           case when $6 = 'processing' then now() else null end,
           case when $6 in ('completed', 'failed') then now() else null end,
@@ -319,6 +321,7 @@ async def update_analysis_job(
         status,
         error_text,
     )
+    await conn.execute("select pg_notify('aedos_media', $1)", image_sha256 or url)
 
 
 def provider_signature(settings: dict[str, str]) -> tuple[str, str, str]:
@@ -447,6 +450,10 @@ async def store_verdict(
         verdict.explanation,
         json.dumps(verdict.provider_response) if verdict.provider_response is not None else None,
     )
+    if target_type == "event" and verdict.status != "unknown":
+        await conn.execute("select pg_notify('aedos_verdicts', $1)", target_id)
+    if target_type in {"image", "video"}:
+        await conn.execute("select pg_notify('aedos_media', $1)", target_id)
 
 
 async def store_emergency_escalation(

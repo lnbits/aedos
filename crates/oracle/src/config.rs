@@ -19,6 +19,10 @@ pub struct Config {
     pub http_bind: SocketAddr,
     pub oracle_verdict_kind: u64,
     pub api_keys: Vec<String>,
+    pub allowed_origins: Vec<String>,
+    pub secure_cookies: bool,
+    pub enable_label_publisher: bool,
+    pub label_publish_interval_seconds: u64,
 }
 
 impl Config {
@@ -43,6 +47,10 @@ impl Config {
             http_bind,
             oracle_verdict_kind: env_u64("ORACLE_VERDICT_KIND", 31494),
             api_keys: csv_env("API_KEYS"),
+            allowed_origins: csv_env("ALLOWED_ORIGINS"),
+            secure_cookies: bool_env("SECURE_COOKIES", false),
+            enable_label_publisher: bool_env("ENABLE_LABEL_PUBLISHER", true),
+            label_publish_interval_seconds: env_u64("LABEL_PUBLISH_INTERVAL_SECONDS", 10),
         })
     }
 
@@ -62,6 +70,10 @@ impl Config {
             "http_bind": self.http_bind.to_string(),
             "oracle_verdict_kind": self.oracle_verdict_kind,
             "api_keys_configured": !self.api_keys.is_empty(),
+            "allowed_origins": self.allowed_origins,
+            "secure_cookies": self.secure_cookies,
+            "enable_label_publisher": self.enable_label_publisher,
+            "label_publish_interval_seconds": self.label_publish_interval_seconds,
         })
     }
 }

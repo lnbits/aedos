@@ -6,7 +6,8 @@ use std::{
 use anyhow::Result;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderValue, Method, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -14,7 +15,10 @@ use axum::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    trace::TraceLayer,
+};
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -60,9 +64,87 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/npubs/nsfw", get(get_nsfw_authors))
         .route("/v1/npubs/csam", get(get_csam_authors))
         .route("/v1/ws", get(ws_handler))
-        .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
+        .layer(cors_layer(&state.config))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+fn cors_layer(config: &Config) -> CorsLayer {
+    let mut layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::HeaderName::from_static("x-api-key")])
+        .expose_headers([header::CONTENT_TYPE]);
+
+    if !config.allowed_origins.is_empty() {
+        let origins = config
+            .allowed_origins
+            .iter()
+            .filter_map(|origin| HeaderValue::from_str(origin).ok())
+            .collect::<Vec<_>>();
+        if !origins.is_empty() {
+            layer = layer.allow_origin(AllowOrigin::list(origins));
+        }
+    }
+
+    layer
+}
+
+async fn require_api_key(
+    State(state): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if !requires_public_api_key(request.uri().path()) || state.config.api_keys.is_empty() {
+        return Ok(next.run(request).await);
+    }
+
+    let supplied_key = api_key_from_request(&request);
+    if supplied_key
+        .as_deref()
+        .is_some_and(|key| state.config.api_keys.iter().any(|known| known == key))
+    {
+        Ok(next.run(request).await)
+    } else {
+        Err(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "missing or invalid API key".to_string(),
+        })
+    }
+}
+
+fn requires_public_api_key(path: &str) -> bool {
+    path.starts_with("/v1/") || path == "/metrics"
+}
+
+fn api_key_from_request(request: &Request<axum::body::Body>) -> Option<String> {
+    request
+        .headers()
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| bearer_token(request))
+        .or_else(|| query_api_key(request.uri().query()))
+}
+
+fn bearer_token(request: &Request<axum::body::Body>) -> Option<String> {
+    request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn query_api_key(query: Option<&str>) -> Option<String> {
+    query?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find_map(|(key, value)| (key == "api_key" && !value.is_empty()).then(|| value.to_string()))
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -402,6 +484,11 @@ async fn record_analysis_jobs(
         .execute(pool)
         .await
         .map_err(anyhow::Error::from)?;
+        sqlx::query("select pg_notify('aedos_media', $1)")
+            .bind(url)
+            .execute(pool)
+            .await
+            .map_err(anyhow::Error::from)?;
     }
     Ok(())
 }
@@ -754,11 +841,21 @@ mod tests {
                 http_bind: "127.0.0.1:0".parse().unwrap(),
                 oracle_verdict_kind: 31494,
                 api_keys: vec![],
+                allowed_origins: vec!["http://localhost:3000".to_string()],
+                secure_cookies: false,
+                enable_label_publisher: false,
+                label_publish_interval_seconds: 10,
             }),
             store: Store::memory(),
             queue: Queue::memory(),
             metrics: Arc::new(Metrics::default()),
         }
+    }
+
+    fn test_state_with_api_key() -> AppState {
+        let mut state = test_state();
+        Arc::get_mut(&mut state.config).unwrap().api_keys = vec!["secret-test-key".to_string()];
+        state
     }
 
     #[tokio::test]
@@ -793,6 +890,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn api_key_is_required_when_configured() {
+        let response = router(test_state_with_api_key())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/check")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"event_id":"abc"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn api_key_allows_public_request() {
+        let response = router(test_state_with_api_key())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/check")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "secret-test-key")
+                    .body(Body::from(r#"{"event_id":"abc"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
