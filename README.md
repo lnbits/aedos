@@ -18,7 +18,7 @@ Nostr gives users, clients, and relays freedom, but it also means every app is l
 - Provides a SvelteKit admin dashboard with login, stats, media review, recheck actions, settings, theme toggle, relay status, and job error visibility.
 - Generates NIP-32 label drafts using kind `1985`.
 - Publishes stored event verdicts as NIP-32 labels when `NOSTR_PRIVATE_KEY`, `NOSTR_RELAYS`, and `ENABLE_LABEL_PUBLISHER=true` are configured.
-- Serves a public moderation policy page at `/moderation`; by default the NIP-32 label namespace is derived from `PUBLIC_BASE_URL + /moderation`.
+- Serves a public Aedos route at `/` with policy, trust, and integration details; by default the NIP-32 label namespace is derived from `PUBLIC_BASE_URL`.
 
 ## Current Limits
 
@@ -51,6 +51,7 @@ Published ports can be changed in `.env`:
 DASHBOARD_PORT=3001
 ORACLE_PORT=8081
 PUBLIC_ORACLE_BASE_URL=http://localhost:8081
+PUBLIC_BASE_URL=http://localhost:3001
 POSTGRES_PORT=5433
 REDIS_PORT=6380
 ```
@@ -89,7 +90,7 @@ The admin control surface lives at:
 http://localhost:3000/admin
 ```
 
-The admin dashboard uses a browser WebSocket for live media updates. If you change `ORACLE_PORT` or run Aedos behind a domain/reverse proxy, set `PUBLIC_ORACLE_BASE_URL` to the browser-reachable oracle URL, for example `https://aedos.example` or `http://server-ip:8081`.
+The admin dashboard uses a browser WebSocket for live media updates. If you change `ORACLE_PORT` or run Aedos behind a domain/reverse proxy, set `PUBLIC_ORACLE_BASE_URL` to the browser-reachable oracle API URL, for example `https://api.aedos.example` or `http://server-ip:8081`. Set `PUBLIC_BASE_URL` to the public dashboard/root URL, for example `https://aedos.example`.
 
 On first login, create the first admin account. The dashboard stores the password with Argon2 and uses an HttpOnly, SameSite session cookie.
 
@@ -121,10 +122,10 @@ Check the API:
 curl http://localhost:8080/health
 ```
 
-Open the public moderation policy page:
+Open the public Aedos page:
 
 ```text
-http://localhost:8080/moderation
+http://localhost:3000
 ```
 
 Stop the stack:
@@ -295,10 +296,10 @@ If `LABEL_NAMESPACE` is not explicitly set, Aedos derives it from `PUBLIC_BASE_U
 
 ```text
 PUBLIC_BASE_URL=https://your-aedos.example
-LABEL_NAMESPACE=https://your-aedos.example/moderation
+LABEL_NAMESPACE=https://your-aedos.example
 ```
 
-That URL is served by Aedos as a public, non-secret moderation policy page explaining what the instance does, what provider class it uses, which labels it emits, and how its tag rules work.
+That URL should point at the public Aedos route, which explains what the instance does, what provider class it uses, which labels it emits, and how its tag rules work without exposing secrets.
 
 There is also a configurable realtime event draft kind, `ORACLE_VERDICT_KIND`, defaulting to `31494`. That is Aedos-specific and useful for direct integrations, but NIP-32 kind `1985` is the standards-aligned format clients and relays should prefer.
 
@@ -466,7 +467,6 @@ Public API:
 - `GET /v1/npubs/csam`
 - `GET /v1/ws`
 - `GET /v1/ws/firehose`
-- `GET /moderation`
 - `GET /health`
 - `GET /metrics`
 

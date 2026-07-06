@@ -77,7 +77,7 @@
     DEFAULT_POLICY: 'Fallback verdict when an event cannot be fully reviewed. Usually blur_unknown or block_unknown.',
     ENABLE_ESCALATION: 'Reserved for serious incident workflows. Keep false unless you have a legal/process path in place.',
     IMAGE_FETCH_TIMEOUT_SECONDS: 'How long the worker waits when downloading media before marking the job as failed.',
-    LABEL_NAMESPACE: 'Nostr label namespace written into published moderation labels. Leave empty before first setup to use PUBLIC_BASE_URL/moderation.',
+    LABEL_NAMESPACE: 'Nostr label namespace written into published moderation labels. Leave empty before first setup to use PUBLIC_BASE_URL.',
     MAX_IMAGE_BYTES: 'Largest image the worker will download and review. Bigger values cost more bandwidth and AI spend.',
     MAX_VIDEO_BYTES: 'Largest video the worker will download before sampling frames for review.',
     MAX_VIDEO_FRAMES: 'Maximum number of video frames sampled and sent to the moderation provider.',

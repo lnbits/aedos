@@ -93,8 +93,8 @@ impl Config {
 
 fn default_label_namespace(public_base_url: Option<&str>) -> String {
     public_base_url
-        .map(|url| format!("{}/moderation", url.trim_end_matches('/')))
-        .unwrap_or_else(|| "http://localhost:8080/moderation".to_string())
+        .map(|url| url.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| "http://localhost:8080".to_string())
 }
 
 fn optional_env(key: &str) -> Option<String> {
@@ -146,10 +146,10 @@ mod tests {
     use super::{csv_env_with_default, default_label_namespace, DEFAULT_NOSTR_RELAYS};
 
     #[test]
-    fn label_namespace_defaults_to_public_moderation_url() {
+    fn label_namespace_defaults_to_public_base_url() {
         assert_eq!(
             default_label_namespace(Some("https://aedos.example/")),
-            "https://aedos.example/moderation"
+            "https://aedos.example"
         );
     }
 

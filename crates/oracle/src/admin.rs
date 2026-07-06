@@ -187,14 +187,14 @@ impl AdminError {
 }
 
 impl From<anyhow::Error> for AdminError {
-    fn from(value: anyhow::Error) -> Self {
-        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: value.to_string() }
+    fn from(_value: anyhow::Error) -> Self {
+        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: "internal server error".to_string() }
     }
 }
 
 impl From<sqlx::Error> for AdminError {
-    fn from(value: sqlx::Error) -> Self {
-        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: value.to_string() }
+    fn from(_value: sqlx::Error) -> Self {
+        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: "internal server error".to_string() }
     }
 }
 
@@ -1225,4 +1225,17 @@ async fn rate_limit_value(pool: &PgPool, key: &str, default_limit: i64) -> Resul
         return Ok(default_limit);
     };
     Ok(row.try_get::<String, _>("value")?.parse().unwrap_or(default_limit))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_admin_errors_do_not_expose_source_message() {
+        let error = AdminError::from(anyhow::anyhow!("sensitive internal detail"));
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.message, "internal server error");
+    }
 }

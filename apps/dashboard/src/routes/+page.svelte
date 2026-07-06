@@ -43,6 +43,7 @@
     <a class="brand" href="/" aria-label="Aedos home"><img src={brandLogo} alt="" />AEDOS</a>
     <nav>
       <a href="#policy">Policy</a>
+      <a href="#trust">Trust</a>
       <a href="#integration">Integration</a>
       <a href="/login">Login</a>
       <button class="theme-toggle" type="button" onclick={toggleTheme}>{theme === 'light' ? 'Dark' : 'Light'}</button>
@@ -60,6 +61,25 @@
     <div class="actions">
       <a class="button primary" href="/login">Operator Login</a>
       <a class="button" href="#integration">Integration Details</a>
+    </div>
+  </section>
+
+  <section class="identity-strip" aria-label="Instance summary">
+    <div>
+      <span>Review Scope</span>
+      <strong>Notes, tags, images, videos</strong>
+    </div>
+    <div>
+      <span>Trust Boundary</span>
+      <strong>Signed Nostr events</strong>
+    </div>
+    <div>
+      <span>Media Storage</span>
+      <strong>No media bytes stored</strong>
+    </div>
+    <div>
+      <span>Primary API</span>
+      <strong>WebSocket + HTTP</strong>
     </div>
   </section>
 
@@ -89,11 +109,72 @@
       </p>
     </article>
     <article>
+      <span>Signed Events</span>
+      <h2>Notes Prove Their Own Media</h2>
+      <p>
+        Aedos verifies full signed events directly, or fetches the signed event from configured
+        relays when only an event ID is supplied. Caller-supplied media links are not trusted unless
+        they appear in the signed note.
+      </p>
+    </article>
+    <article>
+      <span>Video</span>
+      <h2>Frame Sampling</h2>
+      <p>
+        Videos are reviewed by sampling visual frames. Audio, subtitles, playlists, and hidden
+        streams are not treated as reviewed content.
+      </p>
+    </article>
+    <article>
       <span>Nostr Labels</span>
       <h2>NIP-32 Friendly</h2>
       <p>
         Verdicts can be published as NIP-32 kind <code>1985</code> label events, signed by the
         Aedos operator key so clients and relays can verify the source.
+      </p>
+    </article>
+    <article>
+      <span>Cache</span>
+      <h2>Reviewed Once</h2>
+      <p>
+        Completed verdicts are reused by event ID and media hash. Repeated checks can return quickly
+        without sending the same media back through the AI reviewer.
+      </p>
+    </article>
+  </section>
+
+  <section class="grid trust-grid" id="trust">
+    <article>
+      <span>Verdicts</span>
+      <h2>Advisory Signals</h2>
+      <p>
+        Aedos returns labels such as <code>safe</code>, <code>warn</code>, <code>block</code>,
+        <code>unknown</code>, and <code>error</code>. Relays and clients decide how strict their
+        own filtering should be.
+      </p>
+    </article>
+    <article>
+      <span>Safety Process</span>
+      <h2>CSAM Needs Operations</h2>
+      <p>
+        Code can flag, filter, and label suspected material, but operators still need their own
+        legal process, access controls, retention policy, and escalation path.
+      </p>
+    </article>
+    <article>
+      <span>Secrets</span>
+      <h2>No Keys On This Page</h2>
+      <p>
+        The public page can explain the provider class and integration surface, but API keys,
+        OpenAI keys, admin passwords, and Nostr private keys stay inside operator-only settings.
+      </p>
+    </article>
+    <article>
+      <span>Limitations</span>
+      <h2>Not Perfect Judgement</h2>
+      <p>
+        AI review and tag rules can make mistakes. Aedos is designed to make review results
+        reusable, auditable, and easy to override.
       </p>
     </article>
   </section>
@@ -102,6 +183,10 @@
     <div>
       <p class="eyebrow">Integration</p>
       <h2>Relays and clients can use HTTP, WebSockets, or Nostr labels.</h2>
+      <p>
+        WebSocket is the best fit for relays and feed clients: submit a signed event or event
+        reference, keep the connection open, and receive updates as verdicts complete.
+      </p>
     </div>
     <dl>
       <div>
@@ -117,8 +202,16 @@
         <dd><code>POST /v1/check</code></dd>
       </div>
       <div>
-        <dt>Policy Namespace</dt>
-        <dd><code>/moderation</code></dd>
+        <dt>Event References</dt>
+        <dd><code>hex, note..., nevent...</code></dd>
+      </div>
+      <div>
+        <dt>Preferred Payload</dt>
+        <dd><code>raw_event</code></dd>
+      </div>
+      <div>
+        <dt>Label Events</dt>
+        <dd><code>NIP-32 kind 1985</code></dd>
       </div>
     </dl>
   </section>
@@ -277,11 +370,47 @@
     border-left: 1px solid var(--line);
   }
 
+  .identity-strip {
+    max-width: 1060px;
+    margin: 0 auto 72px;
+    padding: 0 28px;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    border-top: 1px solid var(--line);
+    border-left: 1px solid var(--line);
+  }
+
+  .identity-strip div {
+    min-height: 104px;
+    padding: 18px;
+    border-right: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+
+  .identity-strip span {
+    display: block;
+    margin-bottom: 10px;
+    color: var(--muted);
+    font-size: 0.72rem;
+    font-weight: 900;
+    text-transform: uppercase;
+  }
+
+  .identity-strip strong {
+    display: block;
+    font-size: 1.05rem;
+    line-height: 1.35;
+  }
+
   article {
     min-height: 220px;
     padding: 22px;
     border-right: 1px solid var(--line);
     border-bottom: 1px solid var(--line);
+  }
+
+  .trust-grid {
+    padding-bottom: 72px;
   }
 
   .panel {
@@ -342,7 +471,8 @@
     }
 
     .grid,
-    .panel {
+    .panel,
+    .identity-strip {
       grid-template-columns: 1fr;
     }
   }
