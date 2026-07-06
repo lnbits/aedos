@@ -93,6 +93,8 @@ The admin dashboard uses a browser WebSocket for live media updates. If you chan
 
 On first login, create the first admin account. The dashboard stores the password with Argon2 and uses an HttpOnly, SameSite session cookie.
 
+`API_KEYS` is an Aedos access-control setting, not an OpenAI key. Create your own long random value and save it in the dashboard Settings page or in `.env` as `API_KEYS=...`. If `API_KEYS` is blank, public `/v1/*` checks do not need the `x-api-key` header.
+
 If `API_KEYS` is set, public `/v1/*` and `/metrics` requests must include one of the configured keys:
 
 ```bash

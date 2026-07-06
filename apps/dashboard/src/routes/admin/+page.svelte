@@ -73,6 +73,7 @@
   const themeStorageKey = 'aedos-theme';
 
   const settingHints: Record<string, string> = {
+    API_KEYS: 'Comma-separated access keys for public /v1, /metrics, and firehose requests. Leave blank to keep public checks open.',
     DEFAULT_POLICY: 'Fallback verdict when an event cannot be fully reviewed. Usually blur_unknown or block_unknown.',
     ENABLE_ESCALATION: 'Reserved for serious incident workflows. Keep false unless you have a legal/process path in place.',
     IMAGE_FETCH_TIMEOUT_SECONDS: 'How long the worker waits when downloading media before marking the job as failed.',

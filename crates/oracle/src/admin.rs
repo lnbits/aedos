@@ -1101,6 +1101,7 @@ fn setting_specs(state: &AppState) -> Vec<SettingSpec> {
         SettingSpec { key: "MODERATION_PROVIDER", value: std::env::var("MODERATION_PROVIDER").unwrap_or_else(|_| "deterministic".to_string()), secret: false },
         SettingSpec { key: "OPENAI_API_KEY", value: std::env::var("OPENAI_API_KEY").unwrap_or_default(), secret: true },
         SettingSpec { key: "OPENAI_MODERATION_MODEL", value: std::env::var("OPENAI_MODERATION_MODEL").unwrap_or_else(|_| "omni-moderation-latest".to_string()), secret: false },
+        SettingSpec { key: "API_KEYS", value: state.config.api_keys.join(","), secret: true },
         SettingSpec { key: "NOSTR_RELAYS", value: state.config.nostr_relays.join(","), secret: false },
         SettingSpec { key: "NOSTR_PRIVATE_KEY", value: state.config.nostr_private_key.clone().unwrap_or_default(), secret: true },
     ]

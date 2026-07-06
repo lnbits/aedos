@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
@@ -12,7 +13,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
@@ -20,8 +20,7 @@ use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
-use tokio::time::{sleep, timeout};
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use tokio::time::sleep;
 use uuid::Uuid;
 
 use crate::{
@@ -38,7 +37,10 @@ use crate::{
     websocket::{firehose_ws_handler, ws_handler},
 };
 
-use nostr_sdk::prelude::{Event, JsonUtil, PublicKey, ToBech32};
+use nostr_sdk::prelude::{
+    Client, Event, EventId, Filter, FilterOptions, FromBech32, JsonUtil, Nip19Event, PublicKey,
+    RelayPoolNotification, SubscribeAutoCloseOptions, ToBech32,
+};
 
 const DEFAULT_WAIT_TIMEOUT_SECONDS: u64 = 30;
 const MAX_WAIT_TIMEOUT_SECONDS: u64 = 60;
@@ -99,8 +101,9 @@ async fn require_api_key(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
-    if !requires_public_api_key(request.uri().path()) || state.config.api_keys.is_empty() {
-        if request.uri().path() == "/v1/ws/firehose" && state.config.api_keys.is_empty() {
+    let api_keys = configured_api_keys(&state).await?;
+    if !requires_public_api_key(request.uri().path()) || api_keys.is_empty() {
+        if request.uri().path() == "/v1/ws/firehose" && api_keys.is_empty() {
             return Err(ApiError {
                 status: StatusCode::UNAUTHORIZED,
                 message: "firehose WebSocket requires API_KEYS to be configured".to_string(),
@@ -112,7 +115,7 @@ async fn require_api_key(
     let supplied_key = api_key_from_request(&request);
     if supplied_key
         .as_deref()
-        .is_some_and(|key| state.config.api_keys.iter().any(|known| constant_time_eq(known.as_bytes(), key.as_bytes())))
+        .is_some_and(|key| api_keys.iter().any(|known| constant_time_eq(known.as_bytes(), key.as_bytes())))
     {
         Ok(next.run(request).await)
     } else {
@@ -121,6 +124,27 @@ async fn require_api_key(
             message: "missing or invalid API key".to_string(),
         })
     }
+}
+
+async fn configured_api_keys(state: &AppState) -> Result<Vec<String>, ApiError> {
+    match state
+        .store
+        .admin_setting_value("API_KEYS")
+        .await
+        .map_err(anyhow::Error::from)?
+    {
+        Some(value) => Ok(split_csv_setting(&value)),
+        None => Ok(state.config.api_keys.clone()),
+    }
+}
+
+fn split_csv_setting(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn requires_public_api_key(path: &str) -> bool {
@@ -349,9 +373,12 @@ async fn check(
     State(state): State<AppState>,
     Json(req): Json<CheckRequest>,
 ) -> Result<Json<VerdictResponse>, ApiError> {
-    admin::check_rate_limit(&state, "public:check", "RATE_LIMIT_CHECKS_PER_MINUTE", 120).await?;
     let wait = req.wait;
     let timeout_seconds = req.timeout_seconds;
+    if let Some((event_id, verdict)) = cached_completed_event_verdict(&state, req.event_id.as_deref()).await? {
+        return Ok(Json(VerdictResponse::from_verdict(event_id, &verdict)));
+    }
+    admin::check_rate_limit(&state, "public:check", "RATE_LIMIT_CHECKS_PER_MINUTE", 120).await?;
     let event = prepare_signed_event(
         &state,
         req.event_id,
@@ -422,9 +449,17 @@ async fn check_batch(
     State(state): State<AppState>,
     Json(req): Json<BatchCheckRequest>,
 ) -> Result<Json<Vec<VerdictResponse>>, ApiError> {
-    admin::check_rate_limit(&state, "public:check_batch", "RATE_LIMIT_CHECKS_PER_MINUTE", 120).await?;
     let mut responses = Vec::with_capacity(req.events.len());
+    let mut has_uncached_event = false;
     for event in req.events {
+        if let Some((event_id, verdict)) = cached_completed_event_verdict(&state, Some(&event.event_id)).await? {
+            responses.push(VerdictResponse::from_verdict(event_id, &verdict));
+            continue;
+        }
+        if !has_uncached_event {
+            admin::check_rate_limit(&state, "public:check_batch", "RATE_LIMIT_CHECKS_PER_MINUTE", 120).await?;
+            has_uncached_event = true;
+        }
         let event = prepare_signed_event(
             &state,
             Some(event.event_id),
@@ -481,9 +516,7 @@ pub async fn prepare_signed_event(
             let Some(event_id) = event_id.as_deref().filter(|value| !value.trim().is_empty()) else {
                 return Err(ApiError::bad_request("signed raw_event or event_id is required".to_string()));
             };
-            fetch_raw_event_from_relays(state, event_id).await?.ok_or_else(|| {
-                ApiError::bad_request(format!("could not fetch signed event {event_id} from configured relays"))
-            })?
+            fetch_raw_event_from_relays(state, event_id).await?
         }
     };
 
@@ -510,6 +543,28 @@ pub async fn prepare_signed_event(
         video_urls: extracted_videos,
         raw_event: None,
     })
+}
+
+pub(crate) async fn cached_completed_event_verdict(
+    state: &AppState,
+    event_id: Option<&str>,
+) -> Result<Option<(String, Verdict)>, ApiError> {
+    let Some(event_id) = event_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let event_id = normalize_event_id_reference(event_id)?;
+    let Some(mut verdict) = state.store.latest_verdict(TargetType::Event, &event_id).await? else {
+        return Ok(None);
+    };
+    if verdict.status == VerdictStatus::Unknown {
+        return Ok(None);
+    }
+    verdict.cache = true;
+    Ok(Some((event_id, verdict)))
+}
+
+pub(crate) fn normalize_event_id_reference(event_id: &str) -> Result<String, ApiError> {
+    Ok(parse_event_reference(event_id)?.event_id.to_string())
 }
 
 pub async fn check_or_enqueue(state: &AppState, event: &BatchEvent) -> Result<Verdict, ApiError> {
@@ -1093,8 +1148,11 @@ fn verified_raw_event_identity(expected_event_id: Option<&str>, raw_event: &Valu
         .verify()
         .map_err(|_| ApiError::bad_request("raw_event signature is invalid".to_string()))?;
     let event_id = event.id.to_string();
-    if expected_event_id.is_some_and(|expected| expected != event_id) {
-        return Err(ApiError::bad_request("event_id does not match signed raw_event id".to_string()));
+    if let Some(expected) = expected_event_id {
+        let expected = parse_event_reference(expected)?.event_id.to_string();
+        if expected != event_id {
+            return Err(ApiError::bad_request("event_id does not match signed raw_event id".to_string()));
+        }
     }
     Ok((event_id, event.pubkey.to_string()))
 }
@@ -1131,51 +1189,125 @@ fn normalize_media_url(media_type: &str, url: &str) -> Result<String, anyhow::Er
     }
 }
 
-async fn fetch_raw_event_from_relays(state: &AppState, event_id: &str) -> Result<Option<Value>, ApiError> {
-    for relay in &state.config.nostr_relays {
-        if let Ok(Some(raw_event)) = fetch_raw_event_from_relay(relay, event_id).await {
-            if verified_raw_event_identity(Some(event_id), &raw_event).is_ok() {
-                return Ok(Some(raw_event));
-            }
-        }
+async fn fetch_raw_event_from_relays(state: &AppState, event_id: &str) -> Result<Value, ApiError> {
+    let event_reference = parse_event_reference(event_id)?;
+    let relays = current_nostr_relays(state, &event_reference.relays).await?;
+    if relays.is_empty() {
+        return Err(ApiError::bad_request("no NOSTR_RELAYS configured for event lookup".to_string()));
     }
-    Ok(None)
+
+    let client = Client::default();
+    for relay in &relays {
+        client.add_relay(relay).await.map_err(anyhow::Error::from)?;
+    }
+    client.connect_with_timeout(Duration::from_secs(5)).await;
+    let connected_count = client
+        .relays()
+        .await
+        .values()
+        .filter(|relay| relay.is_connected())
+        .count();
+    if connected_count == 0 {
+        return Err(ApiError::bad_request(format!(
+            "could not fetch signed event {} because no configured relays connected; tried: {}",
+            event_reference.event_id,
+            relays.join(", ")
+        )));
+    }
+
+    let event = fetch_event_with_grace_window(&client, &relays, event_reference.event_id).await?;
+    let raw_event = serde_json::from_str::<Value>(&event.as_json()).map_err(anyhow::Error::from)?;
+    verified_raw_event_identity(Some(&event_reference.event_id.to_string()), &raw_event).map_err(|err| {
+        ApiError::bad_request(format!(
+            "fetched event {event_id} failed signed event verification: {err}"
+        ))
+    })?;
+    Ok(raw_event)
 }
 
-async fn fetch_raw_event_from_relay(relay: &str, event_id: &str) -> Result<Option<Value>, ApiError> {
-    let request_id = format!("aedos-{event_id}");
-    let request = json!(["REQ", request_id, { "ids": [event_id], "limit": 1 }]).to_string();
-    let close = json!(["CLOSE", request_id]).to_string();
-    let fetch = async {
-        let (mut socket, _) = connect_async(relay).await.map_err(anyhow::Error::from)?;
-        socket.send(WsMessage::Text(request)).await.map_err(anyhow::Error::from)?;
-        while let Some(message) = socket.next().await {
-            let message = message.map_err(anyhow::Error::from)?;
-            let WsMessage::Text(text) = message else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                continue;
-            };
-            let Some(items) = value.as_array() else {
-                continue;
-            };
-            if items.first().and_then(Value::as_str) == Some("EVENT")
-                && items.get(1).and_then(Value::as_str) == Some(request_id.as_str())
+async fn fetch_event_with_grace_window(client: &Client, relays: &[String], event_id: EventId) -> Result<Event, ApiError> {
+    let mut notifications = client.notifications();
+    let filter = Filter::new().id(event_id).limit(1);
+    let options = SubscribeAutoCloseOptions::default()
+        .filter(FilterOptions::WaitDurationAfterEOSE(Duration::from_secs(3)))
+        .timeout(Some(Duration::from_secs(10)));
+    let subscription = client
+        .subscribe_to(relays.to_vec(), vec![filter], Some(options))
+        .await
+        .map_err(|err| {
+            ApiError::bad_request(format!(
+                "could not fetch signed event {event_id} from configured relays: {err}; tried: {}",
+                relays.join(", ")
+            ))
+        })?;
+    let subscription_id = subscription.val;
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Ok(notification) = notifications.recv().await {
+            if let RelayPoolNotification::Event {
+                subscription_id: received_subscription_id,
+                event,
+                ..
+            } = notification
             {
-                let _ = socket.send(WsMessage::Text(close)).await;
-                return Ok(items.get(2).cloned());
-            }
-            if items.first().and_then(Value::as_str) == Some("EOSE") {
-                let _ = socket.send(WsMessage::Text(close)).await;
-                return Ok(None);
+                if received_subscription_id == subscription_id && event.id == event_id {
+                    return Some(*event);
+                }
             }
         }
-        Ok(None)
-    };
-    timeout(Duration::from_secs(5), fetch)
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    client.unsubscribe(subscription_id).await;
+    result.ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "could not fetch signed event {event_id} from configured relays after waiting 10s; tried: {}. If your client has the full signed event, send it as raw_event so Aedos can verify it directly.",
+            relays.join(", ")
+        ))
+    })
+}
+
+struct EventReference {
+    event_id: EventId,
+    relays: Vec<String>,
+}
+
+fn parse_event_reference(event_id: &str) -> Result<EventReference, ApiError> {
+    if let Ok(event_id) = EventId::parse(event_id) {
+        return Ok(EventReference {
+            event_id,
+            relays: Vec::new(),
+        });
+    }
+    if let Ok(nevent) = Nip19Event::from_bech32(event_id) {
+        return Ok(EventReference {
+            event_id: nevent.event_id,
+            relays: nevent.relays,
+        });
+    }
+    Err(ApiError::bad_request(format!(
+        "event_id {event_id} is not a valid Nostr event id, note, or nevent"
+    )))
+}
+
+async fn current_nostr_relays(state: &AppState, relay_hints: &[String]) -> Result<Vec<String>, ApiError> {
+    let configured = state
+        .store
+        .admin_setting_value("NOSTR_RELAYS")
         .await
-        .unwrap_or(Ok(None))
+        .map_err(anyhow::Error::from)?
+        .map(|value| split_csv_setting(&value))
+        .filter(|relays| !relays.is_empty())
+        .unwrap_or_else(|| state.config.nostr_relays.clone());
+    let mut seen = HashSet::new();
+    Ok(relay_hints
+        .iter()
+        .cloned()
+        .chain(configured)
+        .into_iter()
+        .filter(|relay| seen.insert(relay.clone()))
+        .collect())
 }
 
 #[derive(Debug)]
@@ -1483,6 +1615,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_nevent_returns_cached_event_verdict_without_raw_event() {
+        let state = test_state();
+        let event_id = EventId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let nevent = Nip19Event::new(event_id, ["wss://relay.example"]).to_bech32().unwrap();
+        state
+            .store
+            .store_verdict(&Verdict::safe(TargetType::Event, event_id.to_string(), "test"))
+            .await
+            .unwrap();
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/check")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({ "event_id": nevent }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["event_id"], event_id.to_string());
+        assert_eq!(value["status"], "safe");
+        assert_eq!(value["cache"], true);
+    }
+
+    #[tokio::test]
     async fn wait_for_event_verdict_returns_when_worker_stores_result() {
         let state = test_state();
         let store = state.store.clone();
@@ -1610,6 +1773,29 @@ mod tests {
 
         assert_eq!(verified_raw_event_pubkey(&event.id.to_string(), &raw_event), None);
         assert_eq!(verified_raw_event_pubkey("not-the-real-event-id", &serde_json::from_str(&event.as_json()).unwrap()), None);
+    }
+
+    #[test]
+    fn parse_event_reference_accepts_nevent_and_relay_hints() {
+        let event_id = EventId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let nevent = Nip19Event::new(event_id, ["wss://relay.example"]).to_bech32().unwrap();
+
+        let parsed = parse_event_reference(&nevent).unwrap();
+
+        assert_eq!(parsed.event_id.to_string(), event_id.to_string());
+        assert_eq!(parsed.relays, vec!["wss://relay.example".to_string()]);
+    }
+
+    #[test]
+    fn verified_raw_event_identity_accepts_nevent_expected_id() {
+        let (event_id, raw_event) = signed_note("hello from aedos");
+        let nevent = Nip19Event::new(EventId::parse(&event_id).unwrap(), ["wss://relay.example"])
+            .to_bech32()
+            .unwrap();
+
+        let (verified_event_id, _) = verified_raw_event_identity(Some(&nevent), &raw_event).unwrap();
+
+        assert_eq!(verified_event_id, event_id);
     }
 
     #[tokio::test]

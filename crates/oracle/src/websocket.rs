@@ -14,7 +14,10 @@ use sqlx::postgres::PgListener;
 use tokio::sync::mpsc;
 
 use crate::{
-    api::{author_list, check_or_enqueue, prepare_signed_event, AppState},
+    api::{
+        author_list, cached_completed_event_verdict, check_or_enqueue, normalize_event_id_reference,
+        prepare_signed_event, AppState,
+    },
     types::{BatchEvent, TargetType, Verdict, VerdictResponse, VerdictStatus},
 };
 
@@ -132,6 +135,7 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                     Ok(ClientMessage::AuthorList { list, limit, min_events }) => author_list_response(&state, list, limit, min_events).await,
                     Ok(ClientMessage::Unsubscribe { event_ids }) => {
                         for event_id in event_ids {
+                            let event_id = normalize_event_id_reference(&event_id).unwrap_or(event_id);
                             watched_event_ids.remove(&event_id);
                         }
                         vec![WsResponse {
@@ -329,6 +333,21 @@ async fn respond_to_events(state: &AppState, events: Vec<IncomingEvent>) -> Vec<
     let mut responses = Vec::with_capacity(events.len());
     for event in events {
         let fallback_event_id = event.event_id.clone().unwrap_or_default();
+        match cached_completed_event_verdict(state, event.event_id.as_deref()).await {
+            Ok(Some((event_id, verdict))) => {
+                responses.push(verdict_ws_response(event_id, &verdict, false));
+                continue;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                responses.push(WsResponse {
+                    event_id: fallback_event_id,
+                    value: serde_json::json!({ "type": "error", "error": err.to_string() }),
+                    watch: false,
+                });
+                continue;
+            }
+        }
         let event = match prepare_signed_event(
             state,
             event.event_id,
@@ -365,6 +384,17 @@ async fn respond_to_events(state: &AppState, events: Vec<IncomingEvent>) -> Vec<
 async fn subscribe_to_events(state: &AppState, event_ids: Vec<String>) -> Vec<WsResponse> {
     let mut responses = Vec::with_capacity(event_ids.len());
     for event_id in event_ids {
+        let event_id = match normalize_event_id_reference(&event_id) {
+            Ok(event_id) => event_id,
+            Err(err) => {
+                responses.push(WsResponse {
+                    event_id,
+                    value: serde_json::json!({ "type": "error", "error": err.to_string() }),
+                    watch: false,
+                });
+                continue;
+            }
+        };
         let verdict = state
             .store
             .latest_verdict(TargetType::Event, &event_id)
@@ -400,5 +430,138 @@ fn verdict_ws_response(event_id: String, verdict: &Verdict, watch_unknown: bool)
         event_id: event_id.clone(),
         value: serde_json::to_value(VerdictResponse::from_verdict(event_id, verdict)).unwrap(),
         watch: watch_unknown && verdict.status == VerdictStatus::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Config, db::Store, metrics::Metrics, queue::Queue};
+    use nostr_sdk::prelude::{EventBuilder, EventId, JsonUtil, Keys, Nip19Event, ToBech32};
+    use std::sync::Arc;
+
+    fn test_state() -> AppState {
+        AppState {
+            config: Arc::new(Config {
+                database_url: None,
+                redis_url: None,
+                nostr_private_key: None,
+                nostr_relays: vec![],
+                public_base_url: None,
+                label_namespace: "nostr.com/moderation".to_string(),
+                default_policy: "blur_unknown".to_string(),
+                enable_escalation: false,
+                max_image_bytes: 10_000_000,
+                image_fetch_timeout: std::time::Duration::from_secs(10),
+                worker_concurrency: 4,
+                http_bind: "127.0.0.1:0".parse().unwrap(),
+                oracle_verdict_kind: 31494,
+                api_keys: vec![],
+                allowed_origins: vec!["http://localhost:3000".to_string()],
+                secure_cookies: false,
+                enable_label_publisher: false,
+                label_publish_interval_seconds: 10,
+            }),
+            store: Store::memory(),
+            queue: Queue::memory(),
+            metrics: Arc::new(Metrics::default()),
+        }
+    }
+
+    fn signed_note(content: &str) -> (String, Value) {
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note(content)
+            .sign_with_keys(&keys)
+            .unwrap();
+        (event.id.to_string(), serde_json::from_str(&event.as_json()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn websocket_check_accepts_full_signed_event_without_event_id() {
+        let state = test_state();
+        let (event_id, raw_event) = signed_note("hello over websocket");
+
+        let responses = respond_to_events(
+            &state,
+            vec![IncomingEvent {
+                event_id: None,
+                pubkey: None,
+                image_urls: vec![],
+                video_urls: vec![],
+                raw_event: Some(raw_event),
+            }],
+        )
+        .await;
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].event_id, event_id);
+        assert_eq!(responses[0].value["type"], "verdict");
+        assert_eq!(responses[0].value["event_id"], event_id);
+        assert_eq!(responses[0].value["status"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn websocket_check_nevent_returns_cached_verdict_without_relay_fetch() {
+        let state = test_state();
+        let event_id = EventId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let nevent = Nip19Event::new(event_id, ["wss://relay.example"]).to_bech32().unwrap();
+        state
+            .store
+            .store_verdict(&Verdict::safe(TargetType::Event, event_id.to_string(), "test"))
+            .await
+            .unwrap();
+
+        let responses = respond_to_events(
+            &state,
+            vec![IncomingEvent {
+                event_id: Some(nevent),
+                pubkey: None,
+                image_urls: vec![],
+                video_urls: vec![],
+                raw_event: None,
+            }],
+        )
+        .await;
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].event_id, event_id.to_string());
+        assert_eq!(responses[0].value["status"], "safe");
+        assert_eq!(responses[0].value["cache"], true);
+        assert!(!responses[0].watch);
+    }
+
+    #[tokio::test]
+    async fn websocket_subscribe_normalizes_hex_note_and_nevent_ids() {
+        let state = test_state();
+        let hex_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let event_id = EventId::parse(hex_id).unwrap();
+        let note = event_id.to_bech32().unwrap();
+        let nevent = Nip19Event::new(event_id, ["wss://relay.example"]).to_bech32().unwrap();
+        state
+            .store
+            .store_verdict(&Verdict::safe(TargetType::Event, hex_id, "test"))
+            .await
+            .unwrap();
+
+        let responses = subscribe_to_events(&state, vec![hex_id.to_string(), note, nevent]).await;
+
+        assert_eq!(responses.len(), 3);
+        for response in responses {
+            assert_eq!(response.event_id, hex_id);
+            assert_eq!(response.value["event_id"], hex_id);
+            assert_eq!(response.value["status"], "safe");
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_subscribe_reports_invalid_event_id() {
+        let responses = subscribe_to_events(&test_state(), vec!["not-an-event".to_string()]).await;
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].value["type"], "error");
+        assert!(responses[0].value["error"]
+            .as_str()
+            .unwrap()
+            .contains("not a valid Nostr event id"));
     }
 }
