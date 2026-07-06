@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
@@ -19,7 +20,8 @@ use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     trace::TraceLayer,
 };
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use uuid::Uuid;
 
 use crate::{
@@ -350,12 +352,15 @@ async fn check(
     admin::check_rate_limit(&state, "public:check", "RATE_LIMIT_CHECKS_PER_MINUTE", 120).await?;
     let wait = req.wait;
     let timeout_seconds = req.timeout_seconds;
-    let event = BatchEvent {
-        event_id: req.event_id,
-        pubkey: normalized_optional_pubkey(req.pubkey.as_deref())?,
-        image_urls: req.image_urls,
-        video_urls: req.video_urls,
-    };
+    let event = prepare_signed_event(
+        &state,
+        req.event_id,
+        normalized_optional_pubkey(req.pubkey.as_deref())?,
+        req.image_urls,
+        req.video_urls,
+        req.raw_event,
+    )
+    .await?;
     let mut verdict = check_or_enqueue(&state, &event).await?;
     if wait
         && verdict.status == VerdictStatus::Unknown
@@ -400,38 +405,15 @@ async fn submit(
     Json(req): Json<SubmitRequest>,
 ) -> Result<Json<Vec<VerdictResponse>>, ApiError> {
     admin::check_rate_limit(&state, "public:submit", "RATE_LIMIT_CHECKS_PER_MINUTE", 120).await?;
-    let raw_event = req.raw_event;
-    let event_id = req
-        .event_id
-        .or_else(|| raw_event.as_ref().and_then(|event| event.get("id")).and_then(Value::as_str).map(ToString::to_string))
-        .unwrap_or_else(|| "manual-submit".to_string());
-    let mut image_urls = req.image_urls;
-    let mut video_urls = req.video_urls;
-    if let Some(raw_event) = raw_event {
-        let request_pubkey = normalized_optional_pubkey(req.pubkey.as_deref())?;
-        store_raw_event(state.store.pool(), &event_id, &raw_event, request_pubkey.as_deref()).await?;
-        if let Some(verdict) = text_verdict_from_raw_event(&state, &event_id, &raw_event).await? {
-            state.store.store_verdict(&verdict).await?;
-        }
-        let (extracted_images, extracted_videos) = extract_urls_from_raw_event(&raw_event);
-        image_urls.extend(extracted_images);
-        video_urls.extend(extracted_videos);
-        let event = BatchEvent {
-            event_id,
-            pubkey: request_pubkey.or_else(|| raw_event_pubkey(&raw_event).and_then(|pubkey| normalized_pubkey(pubkey).ok())),
-            image_urls,
-            video_urls,
-        };
-        let verdict = check_or_enqueue(&state, &event).await?;
-        return Ok(Json(vec![VerdictResponse::from_verdict(event.event_id, &verdict)]));
-    }
-    let pubkey = normalized_optional_pubkey(req.pubkey.as_deref())?;
-    let event = BatchEvent {
-        event_id,
-        pubkey,
-        image_urls,
-        video_urls,
-    };
+    let event = prepare_signed_event(
+        &state,
+        req.event_id,
+        normalized_optional_pubkey(req.pubkey.as_deref())?,
+        req.image_urls,
+        req.video_urls,
+        req.raw_event,
+    )
+    .await?;
     let verdict = check_or_enqueue(&state, &event).await?;
     Ok(Json(vec![VerdictResponse::from_verdict(event.event_id, &verdict)]))
 }
@@ -443,6 +425,15 @@ async fn check_batch(
     admin::check_rate_limit(&state, "public:check_batch", "RATE_LIMIT_CHECKS_PER_MINUTE", 120).await?;
     let mut responses = Vec::with_capacity(req.events.len());
     for event in req.events {
+        let event = prepare_signed_event(
+            &state,
+            Some(event.event_id),
+            normalized_optional_pubkey(event.pubkey.as_deref())?,
+            event.image_urls,
+            event.video_urls,
+            event.raw_event,
+        )
+        .await?;
         let verdict = check_or_enqueue(&state, &event).await?;
         responses.push(VerdictResponse::from_verdict(event.event_id, &verdict));
     }
@@ -474,6 +465,51 @@ async fn get_video(State(state): State<AppState>, Path(sha256): Path<String>) ->
         .await?
         .unwrap_or_else(|| Verdict::unknown(TargetType::Video, sha256));
     Ok(Json(verdict))
+}
+
+pub async fn prepare_signed_event(
+    state: &AppState,
+    event_id: Option<String>,
+    pubkey: Option<String>,
+    image_urls: Vec<String>,
+    video_urls: Vec<String>,
+    raw_event: Option<Value>,
+) -> Result<BatchEvent, ApiError> {
+    let raw_event = match raw_event {
+        Some(raw_event) => raw_event,
+        None => {
+            let Some(event_id) = event_id.as_deref().filter(|value| !value.trim().is_empty()) else {
+                return Err(ApiError::bad_request("signed raw_event or event_id is required".to_string()));
+            };
+            fetch_raw_event_from_relays(state, event_id).await?.ok_or_else(|| {
+                ApiError::bad_request(format!("could not fetch signed event {event_id} from configured relays"))
+            })?
+        }
+    };
+
+    let (verified_event_id, verified_pubkey) = verified_raw_event_identity(event_id.as_deref(), &raw_event)?;
+    if let Some(pubkey) = pubkey.as_deref() {
+        if pubkey != verified_pubkey {
+            return Err(ApiError::bad_request("supplied pubkey does not match signed event pubkey".to_string()));
+        }
+    }
+
+    store_raw_event(state.store.pool(), &verified_event_id, &raw_event, Some(&verified_pubkey)).await?;
+    if let Some(verdict) = text_verdict_from_raw_event(state, &verified_event_id, &raw_event).await? {
+        state.store.store_verdict(&verdict).await?;
+    }
+
+    let (extracted_images, extracted_videos) = extract_urls_from_raw_event(&raw_event);
+    ensure_urls_belong_to_event("image", &image_urls, &extracted_images)?;
+    ensure_urls_belong_to_event("video", &video_urls, &extracted_videos)?;
+
+    Ok(BatchEvent {
+        event_id: verified_event_id,
+        pubkey: Some(verified_pubkey.to_string()),
+        image_urls: extracted_images,
+        video_urls: extracted_videos,
+        raw_event: None,
+    })
 }
 
 pub async fn check_or_enqueue(state: &AppState, event: &BatchEvent) -> Result<Verdict, ApiError> {
@@ -1050,10 +1086,96 @@ fn raw_event_pubkey(raw_event: &Value) -> Option<&str> {
     raw_event.get("pubkey").and_then(Value::as_str)
 }
 
+fn verified_raw_event_identity(expected_event_id: Option<&str>, raw_event: &Value) -> Result<(String, String), ApiError> {
+    let event = Event::from_json(serde_json::to_string(raw_event).map_err(anyhow::Error::from)?)
+        .map_err(|_| ApiError::bad_request("raw_event is not a valid Nostr event".to_string()))?;
+    event
+        .verify()
+        .map_err(|_| ApiError::bad_request("raw_event signature is invalid".to_string()))?;
+    let event_id = event.id.to_string();
+    if expected_event_id.is_some_and(|expected| expected != event_id) {
+        return Err(ApiError::bad_request("event_id does not match signed raw_event id".to_string()));
+    }
+    Ok((event_id, event.pubkey.to_string()))
+}
+
 fn verified_raw_event_pubkey(expected_event_id: &str, raw_event: &Value) -> Option<String> {
     let event = Event::from_json(serde_json::to_string(raw_event).ok()?).ok()?;
     event.verify().ok()?;
     (event.id.to_string() == expected_event_id).then(|| event.pubkey.to_string())
+}
+
+fn ensure_urls_belong_to_event(media_type: &str, supplied: &[String], extracted: &[String]) -> Result<(), ApiError> {
+    let normalized_extracted = extracted
+        .iter()
+        .map(|url| normalize_media_url(media_type, url))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+
+    for url in supplied {
+        let normalized = normalize_media_url(media_type, url).map_err(|err| ApiError::bad_request(err.to_string()))?;
+        if !normalized_extracted.iter().any(|known| known == &normalized) {
+            return Err(ApiError::bad_request(format!(
+                "{media_type}_urls must be present in the signed raw_event"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_media_url(media_type: &str, url: &str) -> Result<String, anyhow::Error> {
+    if media_type == "video" {
+        normalize_video_url(url)
+    } else {
+        normalize_image_url(url)
+    }
+}
+
+async fn fetch_raw_event_from_relays(state: &AppState, event_id: &str) -> Result<Option<Value>, ApiError> {
+    for relay in &state.config.nostr_relays {
+        if let Ok(Some(raw_event)) = fetch_raw_event_from_relay(relay, event_id).await {
+            if verified_raw_event_identity(Some(event_id), &raw_event).is_ok() {
+                return Ok(Some(raw_event));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn fetch_raw_event_from_relay(relay: &str, event_id: &str) -> Result<Option<Value>, ApiError> {
+    let request_id = format!("aedos-{event_id}");
+    let request = json!(["REQ", request_id, { "ids": [event_id], "limit": 1 }]).to_string();
+    let close = json!(["CLOSE", request_id]).to_string();
+    let fetch = async {
+        let (mut socket, _) = connect_async(relay).await.map_err(anyhow::Error::from)?;
+        socket.send(WsMessage::Text(request)).await.map_err(anyhow::Error::from)?;
+        while let Some(message) = socket.next().await {
+            let message = message.map_err(anyhow::Error::from)?;
+            let WsMessage::Text(text) = message else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            let Some(items) = value.as_array() else {
+                continue;
+            };
+            if items.first().and_then(Value::as_str) == Some("EVENT")
+                && items.get(1).and_then(Value::as_str) == Some(request_id.as_str())
+            {
+                let _ = socket.send(WsMessage::Text(close)).await;
+                return Ok(items.get(2).cloned());
+            }
+            if items.first().and_then(Value::as_str) == Some("EOSE") {
+                let _ = socket.send(WsMessage::Text(close)).await;
+                return Ok(None);
+            }
+        }
+        Ok(None)
+    };
+    timeout(Duration::from_secs(5), fetch)
+        .await
+        .unwrap_or(Ok(None))
 }
 
 #[derive(Debug)]
@@ -1148,8 +1270,17 @@ mod tests {
         state
     }
 
+    fn signed_note(content: &str) -> (String, Value) {
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note(content)
+            .sign_with_keys(&keys)
+            .unwrap();
+        (event.id.to_string(), serde_json::from_str(&event.as_json()).unwrap())
+    }
+
     #[tokio::test]
     async fn check_returns_unknown_and_queues_for_valid_unknown_image() {
+        let (event_id, raw_event) = signed_note("https://example.com/a.png");
         let app = router(test_state());
         let response = app
             .oneshot(
@@ -1157,7 +1288,14 @@ mod tests {
                     .method("POST")
                     .uri("/v1/check")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"event_id":"abc","image_urls":["https://example.com/a.png"]}"#))
+                    .body(Body::from(
+                        json!({
+                            "event_id": event_id,
+                            "image_urls": ["https://example.com/a.png"],
+                            "raw_event": raw_event
+                        })
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -1167,6 +1305,7 @@ mod tests {
 
     #[tokio::test]
     async fn check_blocks_ssrf_urls() {
+        let (event_id, raw_event) = signed_note("http://127.0.0.1/a.png");
         let app = router(test_state());
         let response = app
             .oneshot(
@@ -1174,11 +1313,43 @@ mod tests {
                     .method("POST")
                     .uri("/v1/check")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"event_id":"abc","image_urls":["http://127.0.0.1/a.png"]}"#))
+                    .body(Body::from(
+                        json!({
+                            "event_id": event_id,
+                            "image_urls": ["http://127.0.0.1/a.png"],
+                            "raw_event": raw_event
+                        })
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn check_rejects_media_url_not_present_in_signed_event() {
+        let (event_id, raw_event) = signed_note("https://example.com/innocent.png");
+        let response = router(test_state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/check")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "event_id": event_id,
+                            "image_urls": ["https://example.com/bad.png"],
+                            "raw_event": raw_event
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -1239,6 +1410,7 @@ mod tests {
 
     #[tokio::test]
     async fn api_key_allows_public_request() {
+        let (event_id, raw_event) = signed_note("hello from aedos");
         let response = router(test_state_with_api_key())
             .oneshot(
                 Request::builder()
@@ -1246,7 +1418,7 @@ mod tests {
                     .uri("/v1/check")
                     .header("content-type", "application/json")
                     .header("x-api-key", "secret-test-key")
-                    .body(Body::from(r#"{"event_id":"abc"}"#))
+                    .body(Body::from(json!({ "event_id": event_id, "raw_event": raw_event }).to_string()))
                     .unwrap(),
             )
             .await
@@ -1300,6 +1472,7 @@ mod tests {
                 pubkey: None,
                 image_urls: vec![],
                 video_urls: vec![],
+                raw_event: None,
             },
         )
         .await
@@ -1444,6 +1617,7 @@ mod tests {
         let state = test_state();
         let store = state.store.clone();
         let app = router(state);
+        let (event_id, raw_event) = signed_note("hello #csam");
 
         let response = app
             .oneshot(
@@ -1451,9 +1625,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/submit")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r##"{"raw_event":{"id":"text-event","pubkey":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":1,"content":"hello #csam","tags":[],"created_at":1}}"##,
-                    ))
+                    .body(Body::from(json!({ "raw_event": raw_event }).to_string()))
                     .unwrap(),
             )
             .await
@@ -1461,7 +1633,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let verdict = store
-            .latest_verdict(TargetType::Event, "text-event")
+            .latest_verdict(TargetType::Event, &event_id)
             .await
             .unwrap()
             .unwrap();
@@ -1471,15 +1643,14 @@ mod tests {
 
     #[tokio::test]
     async fn check_accepts_optional_npub_without_media() {
+        let (event_id, raw_event) = signed_note("author-only");
         let response = router(test_state())
             .oneshot(
                 Request::builder()
                     .method("POST")
                     .uri("/v1/check")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"event_id":"author-only","npub":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
-                    ))
+                    .body(Body::from(json!({ "event_id": event_id, "raw_event": raw_event }).to_string()))
                     .unwrap(),
             )
             .await

@@ -3,6 +3,15 @@ use std::{env, net::SocketAddr, time::Duration};
 use anyhow::{Context, Result};
 use serde_json::json;
 
+const DEFAULT_NOSTR_RELAYS: &[&str] = &[
+    "wss://relay.nostr.com",
+    "wss://relay.damus.io",
+    "wss://nos.lol",
+    "wss://nostr.bitcoiner.social",
+    "wss://nostr.mom",
+    "wss://relay.snort.social",
+];
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_url: Option<String>,
@@ -40,7 +49,7 @@ impl Config {
             database_url: optional_env("DATABASE_URL"),
             redis_url: optional_env("REDIS_URL"),
             nostr_private_key: optional_env("NOSTR_PRIVATE_KEY"),
-            nostr_relays: csv_env("NOSTR_RELAYS"),
+            nostr_relays: csv_env_with_default("NOSTR_RELAYS", DEFAULT_NOSTR_RELAYS),
             public_base_url,
             label_namespace,
             default_policy: env::var("DEFAULT_POLICY").unwrap_or_else(|_| "blur_unknown".to_string()),
@@ -102,6 +111,15 @@ fn csv_env(key: &str) -> Vec<String> {
         .collect()
 }
 
+fn csv_env_with_default(key: &str, default: &[&str]) -> Vec<String> {
+    let values = csv_env(key);
+    if values.is_empty() {
+        default.iter().map(|value| (*value).to_string()).collect()
+    } else {
+        values
+    }
+}
+
 fn bool_env(key: &str, default: bool) -> bool {
     env::var(key)
         .ok()
@@ -125,13 +143,29 @@ fn env_usize(key: &str, default: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::default_label_namespace;
+    use super::{csv_env_with_default, default_label_namespace, DEFAULT_NOSTR_RELAYS};
 
     #[test]
     fn label_namespace_defaults_to_public_moderation_url() {
         assert_eq!(
             default_label_namespace(Some("https://aedos.example/")),
             "https://aedos.example/moderation"
+        );
+    }
+
+    #[test]
+    fn nostr_relays_have_production_defaults() {
+        let relays = csv_env_with_default("AEDOS_TEST_MISSING_NOSTR_RELAYS", DEFAULT_NOSTR_RELAYS);
+        assert_eq!(
+            relays,
+            vec![
+                "wss://relay.nostr.com",
+                "wss://relay.damus.io",
+                "wss://nos.lol",
+                "wss://nostr.bitcoiner.social",
+                "wss://nostr.mom",
+                "wss://relay.snort.social",
+            ]
         );
     }
 }

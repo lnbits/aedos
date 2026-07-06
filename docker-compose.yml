@@ -65,6 +65,7 @@ services:
       context: apps/dashboard
     environment:
       ORACLE_BASE_URL: http://oracle:8080
+      PUBLIC_ORACLE_BASE_URL: ${PUBLIC_ORACLE_BASE_URL:-}
       HOST: 0.0.0.0
       PORT: 3000
     ports:

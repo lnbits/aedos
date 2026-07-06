@@ -25,18 +25,16 @@ Content-Type: application/json
 
 Request shape:
 {
-  "event_id": "<nostr event id>",
-  "npub": "<optional npub or hex pubkey>",
-  "image_urls": ["https://example.com/image.jpg"],
-  "video_urls": ["https://example.com/video.mp4"],
+  "raw_event": "<full signed Nostr event JSON object>",
   "wait": false,
   "timeout_seconds": 30
 }
 
 Notes:
-- event_id is required.
-- npub/pubkey, image_urls, and video_urls are optional extras.
-- Treat npub/pubkey on /v1/check as convenience metadata only. Aedos only counts authors in NSFW/CSAM author lists when the author came from a valid signed raw Nostr event submitted to /v1/submit.
+- Prefer sending the full signed Nostr event as raw_event.
+- Alternatively send event_id only; Aedos will attempt to fetch the signed event from its configured relays.
+- Do not send arbitrary image_urls/video_urls as proof. If URL hints are sent, they must already be present in the signed event.
+- Aedos derives event ID, pubkey, media URLs, and text tags from a verified signed event before queueing work.
 - Use wait=true when the relay/client needs a final verdict before taking action.
 - timeout_seconds is clamped by Aedos. Treat timeout/unknown as policy-controlled, not as safe.
 
@@ -67,10 +65,10 @@ Preferred WebSocket flow:
 6. Reconnect with backoff and resubscribe to any still-pending event IDs.
 
 Send one event:
-{"type":"check","event_id":"<event id>","npub":"<optional pubkey>","image_urls":["https://example.com/a.jpg"],"video_urls":["https://example.com/a.mp4"]}
+{"type":"check","raw_event":{"id":"<event id>","pubkey":"<hex pubkey>","kind":1,"content":"<note content>","tags":[],"created_at":1710000000,"sig":"<signature>"}}
 
 Send a batch:
-{"type":"check_batch","events":[{"event_id":"<event id>","npub":"<optional pubkey>","image_urls":[],"video_urls":[]}]}
+{"type":"check_batch","events":[{"event_id":"<event id to fetch from relays>"}]}
 
 Subscribe without queueing new media:
 {"type":"subscribe","event_ids":["<event id>"]}
@@ -161,14 +159,13 @@ curl -X POST "$AEDOS_URL/v1/check" \
   -H 'content-type: application/json' \
   -H "x-api-key: $AEDOS_API_KEY" \
   -d '{
-    "event_id": "example-event",
-    "npub": "npub1...",
-    "image_urls": ["https://example.com/image.jpg"],
-    "video_urls": [],
+    "event_id": "<signed-event-id-to-fetch-from-relays>",
     "wait": true,
     "timeout_seconds": 20
   }'
 ```
+
+When the integration already has the note, prefer sending `raw_event` instead of making Aedos fetch it from relays.
 
 ## Suggested Relay Config
 

@@ -50,6 +50,7 @@ Published ports can be changed in `.env`:
 ```env
 DASHBOARD_PORT=3001
 ORACLE_PORT=8081
+PUBLIC_ORACLE_BASE_URL=http://localhost:8081
 POSTGRES_PORT=5433
 REDIS_PORT=6380
 ```
@@ -88,6 +89,8 @@ The admin control surface lives at:
 http://localhost:3000/admin
 ```
 
+The admin dashboard uses a browser WebSocket for live media updates. If you change `ORACLE_PORT` or run Aedos behind a domain/reverse proxy, set `PUBLIC_ORACLE_BASE_URL` to the browser-reachable oracle URL, for example `https://aedos.example` or `http://server-ip:8081`.
+
 On first login, create the first admin account. The dashboard stores the password with Argon2 and uses an HttpOnly, SameSite session cookie.
 
 If `API_KEYS` is set, public `/v1/*` and `/metrics` requests must include one of the configured keys:
@@ -96,7 +99,16 @@ If `API_KEYS` is set, public `/v1/*` and `/metrics` requests must include one of
 curl -X POST http://localhost:8080/v1/check \
   -H 'content-type: application/json' \
   -H 'x-api-key: your-key' \
-  -d '{"event_id":"example"}'
+  -d '{"event_id":"signed-event-id-to-fetch-from-relays"}'
+```
+
+HTTP `/v1/*` requests can also go through the dashboard server, which is useful when you expose one public app port:
+
+```bash
+curl -X POST http://localhost:3000/v1/check \
+  -H 'content-type: application/json' \
+  -H 'x-api-key: your-key' \
+  -d '{"event_id":"signed-event-id-to-fetch-from-relays"}'
 ```
 
 API keys are accepted as `x-api-key`, `Authorization: Bearer ...`, or `?api_key=...` for WebSocket clients. Prefer headers when possible; use `?api_key=...` only when a browser WebSocket client cannot set headers, because query strings may be captured by proxy/access logs.
@@ -121,27 +133,32 @@ docker compose down
 
 ## Submit Content
 
-`POST /v1/check` accepts an event ID plus optional author, image URLs, and video URLs.
+`POST /v1/check` accepts a signed Nostr event. Send either `raw_event`, or send an `event_id` and Aedos will try to fetch the signed event from configured `NOSTR_RELAYS`.
 
 ```bash
 curl -X POST http://localhost:8080/v1/check \
   -H 'content-type: application/json' \
   -d '{
-    "event_id": "example-event",
-    "npub": "npub1...",
-    "image_urls": ["https://example.com/image.png"],
-    "video_urls": ["https://example.com/video.mp4"]
+    "raw_event": {
+      "id": "...",
+      "pubkey": "...",
+      "kind": 1,
+      "content": "look https://example.com/image.png",
+      "tags": [],
+      "created_at": 1710000000,
+      "sig": "..."
+    }
   }'
 ```
 
-`event_id` is required. `npub`/`pubkey`, `image_urls`, and `video_urls` are optional. The optional `npub`/`pubkey` on `/v1/check` is treated as unverified metadata; it is not enough to put an author on an Aedos author list.
+Unsigned event/media associations are rejected. If `image_urls` or `video_urls` are supplied as hints, each URL must already be present in the signed event. Aedos extracts the event ID, pubkey, text tags, image URLs, and video URLs from the verified note before queueing media.
 
 By default, `/v1/check` queues new media and returns immediately. The first response may be `unknown` while the worker downloads and reviews the media:
 
 ```json
 {
   "type": "verdict",
-  "event_id": "example-event",
+  "event_id": "signed-event-id",
   "status": "unknown",
   "cache": false,
   "labels": ["unknown"],
@@ -157,8 +174,7 @@ For a one-request flow, add `wait: true`. Aedos will queue the work and hold the
 curl -X POST http://localhost:8080/v1/check \
   -H 'content-type: application/json' \
   -d '{
-    "event_id": "example-event",
-    "image_urls": ["https://example.com/image.png"],
+    "event_id": "signed-event-id-from-a-relay",
     "wait": true,
     "timeout_seconds": 30
   }'
@@ -396,7 +412,7 @@ GET /v1/npubs/csam?min_events=2
 
 Responses include the active `min_events` filter, hex pubkeys, bech32 `npub` values when valid, event counts, recent event IDs, and the latest matching time.
 
-These lists are derived from stored verdicts and verified signed event/pubkey links. Caller-supplied `npub` values from `/v1/check` are intentionally ignored for author-list membership, because otherwise a malicious client could attach an innocent author to bad media. They are not external blocklists.
+These lists are derived from stored verdicts and verified signed event/pubkey links. Aedos does not trust caller-supplied event/media/author associations for author-list membership. They are not external blocklists.
 
 ## Queue Reliability
 
@@ -469,13 +485,13 @@ Dashboard API:
 WebSocket check:
 
 ```json
-{"type":"check","event_id":"...","npub":"npub1...","image_urls":["https://example.com/a.png"],"video_urls":["https://example.com/a.mp4"]}
+{"type":"check","raw_event":{"id":"...","pubkey":"...","kind":1,"content":"https://example.com/a.png","tags":[],"created_at":1710000000,"sig":"..."}}
 ```
 
 WebSocket batch check:
 
 ```json
-{"type":"check_batch","events":[{"event_id":"...","npub":"npub1...","image_urls":[],"video_urls":[]}]}
+{"type":"check_batch","events":[{"event_id":"signed-event-id-to-fetch-from-relays"}]}
 ```
 
 The WebSocket returns the current verdict immediately. If that verdict is `unknown` and the request queued media for review, the connection stays subscribed to that event ID and sends another `verdict` message when the worker stores the final result. With Postgres enabled, worker/API verdict writes notify connected WebSockets through `LISTEN/NOTIFY`; a short polling loop remains as a fallback.
@@ -545,6 +561,7 @@ See `.env.example` for defaults. Important values:
 - `REDIS_PORT`
 - `ORACLE_PORT`
 - `DASHBOARD_PORT`
+- `PUBLIC_ORACLE_BASE_URL`
 - `REDIS_URL`
 - `NOSTR_PRIVATE_KEY`
 - `NOSTR_RELAYS`
@@ -576,6 +593,8 @@ See `.env.example` for defaults. Important values:
 `NOSTR_PRIVATE_KEY` is for signing moderation label events so clients and relays can verify that labels came from your Aedos instance.
 
 `NOSTR_RELAYS` are the relays Aedos is configured to use for Nostr label delivery. The dashboard also uses them to show WebSocket connectivity.
+
+The default relays are `wss://relay.nostr.com`, `wss://relay.damus.io`, `wss://nos.lol`, `wss://nostr.bitcoiner.social`, `wss://nostr.mom`, and `wss://relay.snort.social`.
 
 ## Tests
 

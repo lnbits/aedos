@@ -9,11 +9,12 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use serde_json::Value;
 use sqlx::postgres::PgListener;
 use tokio::sync::mpsc;
 
 use crate::{
-    api::{author_list, check_or_enqueue, AppState},
+    api::{author_list, check_or_enqueue, prepare_signed_event, AppState},
     types::{BatchEvent, TargetType, Verdict, VerdictResponse, VerdictStatus},
 };
 
@@ -25,13 +26,16 @@ const VERDICT_NOTIFICATION_CHANNEL: &str = "aedos_verdicts";
 enum ClientMessage {
     #[serde(rename = "check")]
     Check {
-        event_id: String,
+        #[serde(default)]
+        event_id: Option<String>,
         #[serde(default, alias = "npub")]
         pubkey: Option<String>,
         #[serde(default)]
         image_urls: Vec<String>,
         #[serde(default)]
         video_urls: Vec<String>,
+        #[serde(default)]
+        raw_event: Option<Value>,
     },
     #[serde(rename = "check_batch")]
     CheckBatch { events: Vec<BatchEvent> },
@@ -45,6 +49,26 @@ enum ClientMessage {
         limit: Option<i64>,
         min_events: Option<i64>,
     },
+}
+
+struct IncomingEvent {
+    event_id: Option<String>,
+    pubkey: Option<String>,
+    image_urls: Vec<String>,
+    video_urls: Vec<String>,
+    raw_event: Option<Value>,
+}
+
+impl From<BatchEvent> for IncomingEvent {
+    fn from(event: BatchEvent) -> Self {
+        Self {
+            event_id: Some(event.event_id),
+            pubkey: event.pubkey,
+            image_urls: event.image_urls,
+            video_urls: event.video_urls,
+            raw_event: event.raw_event,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,19 +114,20 @@ async fn handle_socket(state: AppState, socket: WebSocket) {
                 };
 
                 let responses = match serde_json::from_str::<ClientMessage>(&text) {
-                    Ok(ClientMessage::Check { event_id, pubkey, image_urls, video_urls }) => {
+                    Ok(ClientMessage::Check { event_id, pubkey, image_urls, video_urls, raw_event }) => {
                         respond_to_events(
                             &state,
-                            vec![BatchEvent {
+                            vec![IncomingEvent {
                                 event_id,
                                 pubkey,
                                 image_urls,
                                 video_urls,
+                                raw_event,
                             }],
                         )
                         .await
                     }
-                    Ok(ClientMessage::CheckBatch { events }) => respond_to_events(&state, events).await,
+                    Ok(ClientMessage::CheckBatch { events }) => respond_to_events(&state, events.into_iter().map(IncomingEvent::from).collect()).await,
                     Ok(ClientMessage::Subscribe { event_ids }) => subscribe_to_events(&state, event_ids).await,
                     Ok(ClientMessage::AuthorList { list, limit, min_events }) => author_list_response(&state, list, limit, min_events).await,
                     Ok(ClientMessage::Unsubscribe { event_ids }) => {
@@ -300,9 +325,30 @@ fn spawn_verdict_listener(state: &AppState) -> mpsc::Receiver<String> {
     rx
 }
 
-async fn respond_to_events(state: &AppState, events: Vec<BatchEvent>) -> Vec<WsResponse> {
+async fn respond_to_events(state: &AppState, events: Vec<IncomingEvent>) -> Vec<WsResponse> {
     let mut responses = Vec::with_capacity(events.len());
     for event in events {
+        let fallback_event_id = event.event_id.clone().unwrap_or_default();
+        let event = match prepare_signed_event(
+            state,
+            event.event_id,
+            event.pubkey,
+            event.image_urls,
+            event.video_urls,
+            event.raw_event,
+        )
+        .await
+        {
+            Ok(event) => event,
+            Err(err) => {
+                responses.push(WsResponse {
+                    event_id: fallback_event_id,
+                    value: serde_json::json!({ "type": "error", "error": err.to_string() }),
+                    watch: false,
+                });
+                continue;
+            }
+        };
         let has_media = !event.image_urls.is_empty() || !event.video_urls.is_empty();
         match check_or_enqueue(state, &event).await {
             Ok(verdict) => responses.push(verdict_ws_response(event.event_id, &verdict, has_media)),

@@ -143,13 +143,16 @@ impl Verdict {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckRequest {
-    pub event_id: String,
+    #[serde(default)]
+    pub event_id: Option<String>,
     #[serde(default, alias = "npub")]
     pub pubkey: Option<String>,
     #[serde(default)]
     pub image_urls: Vec<String>,
     #[serde(default)]
     pub video_urls: Vec<String>,
+    #[serde(default)]
+    pub raw_event: Option<Value>,
     #[serde(default)]
     pub wait: bool,
     #[serde(default)]
@@ -178,6 +181,8 @@ pub struct BatchEvent {
     pub image_urls: Vec<String>,
     #[serde(default)]
     pub video_urls: Vec<String>,
+    #[serde(default)]
+    pub raw_event: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

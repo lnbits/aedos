@@ -1,5 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import { env } from '$env/dynamic/public';
 
   type Session = {
     authenticated: boolean;
@@ -293,11 +294,15 @@
   }
 
   function adminStreamUrl() {
-    const url = new URL('/admin/api/stream', window.location.href);
-    url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    if (url.port === '3000') {
+    const configuredBase = env.PUBLIC_ORACLE_BASE_URL?.trim();
+    const base = configuredBase || window.location.href;
+    const url = new URL('/admin/api/stream', base);
+
+    if (!configuredBase && url.port === '3000') {
       url.port = '8080';
     }
+
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
     return url.toString();
   }
 
